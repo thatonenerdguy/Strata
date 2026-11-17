@@ -6,7 +6,9 @@
 //     normalised then scaled, and at GLM's shape (288 / 8, scale 2.5) they sum to 2.5;
 //   * the dense FFN on a 2 x 3 case worked out by hand.
 #include "strata/glm53/ffn_ref.hpp"
+#include "strata/glm53/mhc_ref.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -93,6 +95,44 @@ int main() {
         G::dense_ffn(x, wg, wu, wd, out, 2, 3, 2.5f);
         const double c0 = silu(1) * 2.5, c1 = silu(2) * 2, c2 = silu(2.5) * -2;
         check(near(out[0], c0 + c1 + c2, 1e-5) && near(out[1], c0 - c2, 1e-5), "and with GLM's clamp");
+    }
+    {   // mHC
+        float c[16];
+        for (float& v : c) v = 0.0f;
+        G::hc_sinkhorn(c, 20, 1e-6f);
+        bool flat = true;
+        for (float v : c) flat = flat && near(v, 0.25, 1e-5);
+        check(flat, "Sinkhorn of equal logits: every comb entry 1/4");
+        std::mt19937 rng(5);
+        std::normal_distribution<float> nd(0.0f, 1.0f);   // logits of a trained model's spread; wider ones converge slower
+        for (float& v : c) v = nd(rng);
+        G::hc_sinkhorn(c, 20, 1e-6f);
+        double off = 0;
+        for (int a = 0; a < 4; ++a) {
+            double rs = 0, cs = 0;
+            for (int b = 0; b < 4; ++b) rs += c[b + 4 * a], cs += c[a + 4 * b];
+            off = std::max(off, std::max(std::fabs(rs - 1), std::fabs(cs - 1)));
+        }
+        check(off < 1e-3, "Sinkhorn of random logits: rows and columns sum to 1");
+        // one Sinkhorn round is the softmax over dst plus one column normalisation: worked by hand for one column
+        float d[16];
+        for (int i = 0; i < 16; ++i) d[i] = (i % 4 == 0) ? 1.0f : 0.0f;   // logit 1 at dst 0 for every src
+        G::hc_sinkhorn(d, 1, 0.0f);
+        const double e = std::exp(1.0), p0 = e / (e + 3), p1 = 1 / (e + 3);
+        check(near(d[0], p0 / (4 * p0), 1e-6) && near(d[1], p1 / (4 * p1), 1e-6), "one Sinkhorn round by hand");
+        // pre / post on a hand-made token: n_embd 2, fn all zero (mixes 0), scale 1, base 0
+        const int64_t N = 2;
+        std::vector<float> st = {1, 2, 3, 4, 5, 6, 7, 8}, fn(24 * 8, 0.0f), sc = {1, 1, 1}, base(24, 0.0f);
+        float in[2];
+        const G::HcWeights w = G::hc_pre(st.data(), fn.data(), sc.data(), base.data(), N, 1e-5f, 20, 0.0f, in);
+        check(near(w.pre[0], 0.5) && near(w.post[2], 1.0) && near(w.comb[5], 0.25, 1e-5),
+              "pre = sigmoid(0), post = 2 sigmoid(0), comb = 1/4 for zero mixes");
+        check(near(in[0], 0.5 * (1 + 3 + 5 + 7)) && near(in[1], 0.5 * (2 + 4 + 6 + 8)), "the sub-layer input is the pre-weighted sum");
+        float out[2] = {10, 20}, nx[8], mean[2];
+        G::hc_post(out, st.data(), w, N, nx);
+        check(near(nx[0], 10 + 0.25 * 16, 1e-4) && near(nx[7], 20 + 0.25 * 20, 1e-4), "post: post * out + comb-mixed streams");
+        G::hc_mean(nx, N, mean);
+        check(near(mean[1], (nx[1] + nx[3] + nx[5] + nx[7]) / 4, 1e-5), "the stream mean");
     }
     std::printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);
     return g_fail ? 1 : 0;

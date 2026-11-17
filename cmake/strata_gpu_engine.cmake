@@ -74,6 +74,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
                           src/kernels/cuda/glm_router.cu
+                          src/kernels/cuda/glm_mhc.cu
                           src/kernels/cuda/route_prior.cu
                           src/kernels/cuda/native_gdn_preprocess.cu
                           src/kernels/cuda/native_qsa.cu

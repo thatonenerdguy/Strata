@@ -5,12 +5,17 @@
 //
 // The router must pick the same experts, except where two candidates' scores are within 1e-5 of each other (the GPU's
 // expf may differ from the host's in the last bit), and give the same weights within 2e-6 relative.  The SwiGLU must
-// match within 2e-6 relative, with and without GLM's clamp.
+// match within 2e-6 relative, with and without GLM's clamp.  The hyper-connections (kernels/glm_mhc.hpp, glm53/mhc_ref.hpp)
+// run on 256 tokens of 4 x 4096 streams: the 24 weights within 1e-4, the sub-layer input, the new streams and the mean
+// within 1e-5 relative L2 (float sums over 16384 values against double).
 #include "strata/glm53/ffn_ref.hpp"
+#include "strata/glm53/mhc_ref.hpp"
+#include "strata/kernels/glm_mhc.hpp"
 #include "strata/kernels/glm_router.hpp"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -118,6 +123,69 @@ int main(int argc, char** argv) {
             off += !rel(o[(size_t) i], strata::glm53::swiglu_clamped(g[(size_t) i], u[(size_t) i], limit), 2e-6f);
         check(off == 0, "SwiGLU, limit " + std::to_string(limit) + ": " + std::to_string(off) + " of " +
                             std::to_string(n) + " values off");
+    }
+
+    {   // mHC: pre, post, mean on 256 tokens of 4 x 4096
+        namespace G = strata::glm53;
+        const int T = 256, N = 4096, D = G::kHc * N, iters = 20;
+        const float rms_eps = 1e-5f, hc_eps = 1e-6f;
+        std::uniform_real_distribution<float> ud(0.5f, 1.5f);
+        std::vector<float> st((size_t) T * D), fn((size_t) G::kHcMix * D), sc(3), base(G::kHcMix), out((size_t) T * N);
+        for (auto& v : st) v = nd(rng);
+        for (int t = 0; t < T; ++t) st[(size_t) t * D + (size_t) (t * 131 % D)] *= 30.0f;
+        for (auto& v : fn) v = 0.004f * nd(rng);
+        for (auto& v : sc) v = ud(rng);
+        for (auto& v : base) v = 0.2f * nd(rng);
+        for (auto& v : out) v = nd(rng);
+        float *d_st = upload(st), *d_fn = upload(fn), *d_sc = upload(sc), *d_base = upload(base), *d_out = upload(out);
+        float *d_in = nullptr, *d_wt = nullptr, *d_next = nullptr, *d_mean = nullptr;
+        CK(cudaMalloc(&d_in, (size_t) T * N * 4));
+        CK(cudaMalloc(&d_wt, (size_t) T * strata::kernels::kGlmHcWeights * 4));
+        CK(cudaMalloc(&d_next, (size_t) T * D * 4));
+        CK(cudaMalloc(&d_mean, (size_t) T * N * 4));
+        strata::kernels::glm_hc_pre(d_st, d_fn, d_sc, d_base, N, rms_eps, iters, hc_eps, d_in, d_wt, T, s);
+        strata::kernels::glm_hc_post(d_out, d_st, d_wt, N, d_next, T, s);
+        strata::kernels::glm_hc_mean(d_next, N, d_mean, T, s);
+        CK(cudaStreamSynchronize(s));
+        const auto g_in = download(d_in, (size_t) T * N), g_wt = download(d_wt, (size_t) T * G::kHcMix);
+        const auto g_next = download(d_next, (size_t) T * D), g_mean = download(d_mean, (size_t) T * N);
+        std::vector<float> r_in((size_t) T * N), r_next((size_t) T * D), r_mean((size_t) T * N);
+        double w_err = 0, ds = 0;
+        auto rl2 = [](const float* a, const float* b, size_t n) {
+            double dd = 0, bb = 0;
+            for (size_t i = 0; i < n; ++i) dd += (double) (a[i] - b[i]) * (a[i] - b[i]), bb += (double) b[i] * b[i];
+            return std::sqrt(dd / std::max(bb, 1e-30));
+        };
+        double e_in = 0, e_next = 0, e_mean = 0;
+        for (int t = 0; t < T; ++t) {
+            const G::HcWeights w = G::hc_pre(st.data() + (size_t) t * D, fn.data(), sc.data(), base.data(), N, rms_eps,
+                                             iters, hc_eps, r_in.data() + (size_t) t * N);
+            const float* wf = &w.pre[0];
+            for (int i = 0; i < G::kHcMix; ++i) w_err = std::max(w_err, (double) std::fabs(g_wt[(size_t) t * G::kHcMix + i] - wf[i]));
+            // Sinkhorn ends on a column normalisation, so the GPU's columns (every dst over its src) sum to 1
+            for (int a = 0; a < G::kHc; ++a) {
+                double cs = 0;
+                for (int b = 0; b < G::kHc; ++b) cs += g_wt[(size_t) t * G::kHcMix + 2 * G::kHc + a + G::kHc * b];
+                ds = std::max(ds, std::fabs(cs - 1));
+            }
+            G::hc_post(out.data() + (size_t) t * N, st.data() + (size_t) t * D, w, N, r_next.data() + (size_t) t * D);
+            G::hc_mean(r_next.data() + (size_t) t * D, N, r_mean.data() + (size_t) t * N);
+            e_in = std::max(e_in, rl2(g_in.data() + (size_t) t * N, r_in.data() + (size_t) t * N, N));
+            e_next = std::max(e_next, rl2(g_next.data() + (size_t) t * D, r_next.data() + (size_t) t * D, D));
+            e_mean = std::max(e_mean, rl2(g_mean.data() + (size_t) t * N, r_mean.data() + (size_t) t * N, N));
+        }
+        char b[160];
+        std::snprintf(b, sizeof b, "mHC weights (pre, post, Sinkhorn comb): max abs diff %.2e", w_err);
+        check(w_err <= 1e-4, b);
+        std::snprintf(b, sizeof b, "mHC comb columns sum to 1 on the GPU: max off %.2e", ds);
+        check(ds <= 1e-4, b);
+        std::snprintf(b, sizeof b, "mHC sub-layer input: rel L2 %.2e", e_in);
+        check(e_in <= 1e-5, b);
+        std::snprintf(b, sizeof b, "mHC new streams: rel L2 %.2e", e_next);
+        check(e_next <= 1e-5, b);
+        std::snprintf(b, sizeof b, "mHC stream mean: rel L2 %.2e", e_mean);
+        check(e_mean <= 1e-5, b);
+        for (float* p : {d_st, d_fn, d_sc, d_base, d_out, d_in, d_wt, d_next, d_mean}) cudaFree(p);
     }
     cudaFree(d_logits), cudaFree(d_bias), cudaFree(d_ids), cudaFree(d_w), cudaFree(d_g), cudaFree(d_u), cudaFree(d_o);
     cudaStreamDestroy(s);
