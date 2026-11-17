@@ -648,10 +648,12 @@ int main(int argc, char** argv) {
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
         // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
-        // thread goes; it works in the drain too); --threads N asks for N threads in all, as --pool-workers N - 1
+        // thread goes; it works in the drain too); --threads N asks for N threads in all, as --pool-workers N - 1.
+        // The pool FIRST: it reads the CPUs this thread may run on, so pinning before it leaves it one core
+        // (generate.cpp's order too).
+        r.pool = std::make_unique<KC::ExpertPool>(threads > 1 ? threads - 1 : 0);
         const int host = KC::planned_host_core();
         if (host >= 0) KC::pin_current_thread(host);
-        r.pool = std::make_unique<KC::ExpertPool>(threads > 1 ? threads - 1 : 0);
     }
     std::string err;
     if (!strata::core::glm5_geometry_from_gguf(gm.meta(), r.c.g, err)) die(err);
