@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -44,7 +45,9 @@ struct Glm5Geometry {
     // KDA
     int64_t kda_head_dim = 128;      ///< kda.head_dim
     int64_t ssm_d_conv = 4;          ///< ssm.conv_kernel
-    double kda_gate_lower_bound = 0; ///< kda.gate_lower_bound (optional; the config's -5)
+    /// kda.gate_lower_bound (optional; the config's -5).  Absent = -infinity, llama.cpp's default: the decay is then
+    /// softplus(g) * A instead of lower_bound * sigmoid(-g * A).
+    double kda_gate_lower_bound = -std::numeric_limits<double>::infinity();
 
     // MLA
     int64_t q_lora = 1536;           ///< attention.q_lora_rank
