@@ -1169,6 +1169,9 @@ class OutputParser:
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
+        # GLM-5 opens its reasoning itself (its template ends at <|assistant|>; Qwen's opens <think> in the prompt): a reply
+        # that starts with <think> has it dropped once, so it never shows as reasoning text.  Decided by the first text.
+        self._lead_think = thinking
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # #4663: the request defers tools (Anthropic's tool search, see anthropic_tools): the client holds back more tools
@@ -1687,6 +1690,16 @@ class OutputParser:
         if self._held:
             delta, self._held = self._held + delta, ""
         self.buf += delta
+        if self._lead_think and self.state == "reasoning":
+            head = self.buf.lstrip()
+            if head.startswith("<think>"):
+                self.buf, self._lead_think = head[len("<think>"):], False
+            elif "<think>".startswith(head):
+                return []                        # only whitespace or the start of <think> so far: wait for more
+            else:
+                self._lead_think = False
+        elif self._lead_think:
+            self._lead_think = False
         if self.schemas and delta:
             self._held = self._prefixed(len(delta))
         return self._feed()

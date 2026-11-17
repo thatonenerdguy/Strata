@@ -29,6 +29,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <iostream>
 #include <functional>
 #include <list>
 #include <memory>
@@ -668,9 +671,9 @@ struct Runner {
         }
         pos += T;
     }
-    /// The whole prompt, `chunk` tokens a step; the last token's logits in `logits`.
-    void prompt(const std::vector<int32_t>& ids) {
-        for (size_t i = 0; i < ids.size(); i += (size_t) chunk) {
+    /// The prompt from ids[from] on, `chunk` tokens a step; the last token's logits in `logits`.
+    void prompt(const std::vector<int32_t>& ids, size_t from = 0) {
+        for (size_t i = from; i < ids.size(); i += (size_t) chunk) {
             const int T = (int) std::min<size_t>((size_t) chunk, ids.size() - i);
             step(ids.data() + i, T, i + (size_t) T == ids.size());
         }
@@ -702,6 +705,160 @@ std::vector<int32_t> parse_ids(const std::string& s) {
 
 }  // namespace
 
+struct Sampling {
+    double temp = 0, top_p = 1, min_p = 0;
+    int top_k = 0;
+};
+/// The next token from the logits: greedy at temperature 0, else top-k / top-p / min-p over the softmax at `temp`.
+int32_t sample(const std::vector<float>& lg, const Sampling& sp, std::mt19937_64& rng) {
+    const int64_t V = (int64_t) lg.size();
+    int64_t best = 0;
+    for (int64_t i = 1; i < V; ++i)
+        if (lg[(size_t) i] > lg[(size_t) best]) best = i;
+    if (!std::isfinite(lg[(size_t) best])) die("the logits are not finite");
+    if (sp.temp <= 0) return (int32_t) best;
+    std::vector<std::pair<double, int32_t>> c;
+    c.reserve((size_t) V);
+    for (int64_t i = 0; i < V; ++i) c.push_back({std::exp((lg[(size_t) i] - lg[(size_t) best]) / sp.temp), (int32_t) i});
+    size_t keep = c.size();
+    if (sp.top_k > 0 && (size_t) sp.top_k < keep) keep = (size_t) sp.top_k;
+    std::partial_sort(c.begin(), c.begin() + (std::ptrdiff_t) keep, c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    c.resize(keep);
+    double sum = 0;
+    for (const auto& x : c) sum += x.first;
+    if (sp.min_p > 0) {   // relative to the most likely token (its weight is 1 here)
+        size_t n = 0;
+        while (n < c.size() && c[n].first >= sp.min_p) ++n;
+        c.resize(std::max<size_t>(n, 1));
+    }
+    if (sp.top_p < 1) {
+        double run = 0;
+        size_t n = 0;
+        while (n < c.size() && run < sp.top_p * sum) run += c[n++].first;
+        c.resize(std::max<size_t>(n, 1));
+    }
+    sum = 0;
+    for (const auto& x : c) sum += x.first;
+    std::uniform_real_distribution<double> u(0.0, sum);
+    double t = u(rng);
+    for (const auto& x : c)
+        if ((t -= x.first) <= 0) return x.second;
+    return c.back().second;
+}
+
+/// --serve: the line protocol Strata's server (serve/server.py StrataEngine) speaks to its engine, so the server, the
+/// app and the tuner run this model as they run the others.  READY <ctx> stop; then per request
+/// "GEN <max_new> [key=value ...] <id,id,...>" -> "T <id>" per token -> "DONE <generated> <prompt tokens> <prompt ms>
+/// <decode ms> <stop|length|cancel> 0 0 <reused>"; "STOP" ends a request early; "QUIT" ends the engine.  A prompt that
+/// extends the previous request's tokens (prompt and reply) reads only the new ones; any other starts from position 0
+/// (the KDA states cannot step back).  Other lines get "ERR ...".
+int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::atomic<bool> stop_req{false};
+    std::thread reader([&] {
+        std::string ln;
+        while (std::getline(std::cin, ln)) {
+            if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+            std::lock_guard<std::mutex> g(mu);
+            if (ln == "STOP") stop_req = true;   // seen at once, also mid-request
+            else lines.push_back(ln);
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> g(mu);
+        eof = true;
+        cv.notify_all();
+    });
+    reader.detach();
+    const int64_t V = r.head.n_out;
+    std::vector<float> lg((size_t) V);
+    std::vector<int32_t> hist;   // the tokens the state holds, in order (hist.size() == r.pos)
+    std::mt19937_64 rng(seed);
+    std::printf("READY %lld stop\n", (long long) r.ctx_max);
+    std::fflush(stdout);
+    for (;;) {
+        std::string ln;
+        {
+            std::unique_lock<std::mutex> g(mu);
+            cv.wait(g, [&] { return eof || !lines.empty(); });
+            if (lines.empty()) return 0;   // stdin closed: the server went away
+            ln = lines.front();
+            lines.pop_front();
+        }
+        if (ln == "QUIT") return 0;
+        std::istringstream in(ln);
+        std::string head;
+        in >> head;
+        if (head != "GEN") {
+            std::printf("ERR %s is not supported by this engine\n", head.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        long long max_new = 0;
+        in >> max_new;
+        Sampling sp;
+        std::vector<int32_t> ids;
+        std::string w;
+        bool bad = false;
+        while (in >> w) {
+            const size_t eq = w.find('=');
+            if (eq != std::string::npos && eq > 0 && !std::isdigit((unsigned char) w[0])) {
+                const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
+                try {
+                    if (k == "temperature") sp.temp = std::stod(v);
+                    else if (k == "top_p") sp.top_p = std::stod(v);
+                    else if (k == "top_k") sp.top_k = std::stoi(v);
+                    else if (k == "min_p") sp.min_p = std::stod(v);
+                    else if (k == "seed") rng.seed(std::stoull(v));
+                    // other keys (penalties, holds, drafting) are the main engine's: ignored here
+                } catch (...) { bad = true; }
+            } else {
+                try { ids = parse_ids(w); } catch (...) { bad = true; }
+            }
+        }
+        if (bad || ids.empty() || max_new < 0) {
+            std::printf("ERR malformed GEN line\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if ((int64_t) ids.size() + max_new + 8 > r.ctx_max) {
+            std::printf("ERR the prompt (%zu tokens) and max_new (%lld) do not fit the context (%lld)\n", ids.size(), max_new,
+                        (long long) r.ctx_max);
+            std::fflush(stdout);
+            continue;
+        }
+        stop_req = false;
+        // reuse: the state holds hist; a prompt that extends it reads only the rest
+        size_t reuse = 0;
+        if (!hist.empty() && ids.size() > hist.size() && std::equal(hist.begin(), hist.end(), ids.begin())) reuse = hist.size();
+        if (reuse == 0 && r.pos != 0) r.reset();
+        const auto t0 = std::chrono::steady_clock::now();
+        r.prompt(ids, reuse);
+        hist = ids;
+        const double prompt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const auto t1 = std::chrono::steady_clock::now();
+        const char* finish = "length";
+        long long made = 0;
+        while (made < max_new) {
+            if (stop_req) { finish = "cancel"; break; }
+            CK(cudaMemcpy(lg.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+            const int32_t t = sample(lg, sp, rng);
+            std::printf("T %d\n", t);
+            std::fflush(stdout);
+            ++made;
+            if (std::find(stop.begin(), stop.end(), t) != stop.end()) { finish = "stop"; break; }
+            if (made >= max_new) break;
+            r.step(&t, 1, true);
+            hist.push_back(t);
+        }
+        const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu\n", made, ids.size(), prompt_ms, decode_ms, finish, reuse);
+        std::fflush(stdout);
+    }
+}
+
 int main(int argc, char** argv) {
     g_tool = "glm_generate";
     std::string model, ids_s, stop_s;
@@ -709,7 +866,7 @@ int main(int argc, char** argv) {
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
     int cpu_exp = 1, threads = 0, chunk = 32;
-    bool check_prompt = false;
+    bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -718,10 +875,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) die("missing value after " + a);
             return argv[++i];
         };
-        if (a == "--model") model = next();
+        if (a == "--serve") serve_mode = true;
+        else if (a == "--model") model = next();
         else if (a == "--ids") ids_s = next();
         else if (a == "--n") n_gen = std::stoi(next());
-        else if (a == "--ctx") ctx = std::stoll(next());
+        else if (a == "--ctx" || a == "--max-context") ctx = std::stoll(next());
         else if (a == "--temp") temp = std::stod(next());
         else if (a == "--seed") seed = std::stoull(next());
         else if (a == "--stop") stop_s = next();
@@ -733,13 +891,20 @@ int main(int argc, char** argv) {
         else if (a == "--dump-routing") dump_routing = next();
         else if (a == "--prompt-chunk") chunk = std::stoi(next());
         else if (a == "--check-prompt") check_prompt = true;
-        else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
+        else if (serve_mode && a.rfind("--", 0) == 0) {
+            // the server adds options of its main engine (drafting, VRAM fit, ...): said and left out, never fatal
+            const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
+            std::fprintf(stderr, "glm_generate: ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "",
+                         val ? argv[i + 1] : "");
+            if (val) ++i;
+        } else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
-                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 32] [--check-prompt]");
+                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 32] [--check-prompt]\n"
+                 "  --serve (Strata's server protocol on stdin/stdout; --ctx / --max-context, --stop, --expert-profile*)");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
-    if (model.empty() || prompt.empty()) die("needs --model and --ids");
-    if ((int64_t) prompt.size() + n_gen > ctx) die("prompt + --n is longer than --ctx");
+    if (model.empty() || (prompt.empty() && !serve_mode)) die("needs --model and --ids (or --serve)");
+    if (!serve_mode && (int64_t) prompt.size() + n_gen > ctx) die("prompt + --n is longer than --ctx");
 
     strata::GgufModel gm = strata::GgufModel::open(model);
     Runner r;
@@ -775,6 +940,10 @@ int main(int argc, char** argv) {
     r.load(cache_gb);
     r.heat.assign((size_t) (r.c.g.n_layers * r.c.g.n_expert), 0.0);
     std::vector<std::pair<int32_t, int32_t>> prior;
+    if (!profile_in.empty() && !std::ifstream(profile_in).good()) {   // the first start: nothing learned yet
+        std::printf("  expert cache: no profile at %s yet (this run's routing will write it)\n", profile_in.c_str());
+        profile_in.clear();
+    }
     if (!profile_in.empty()) {
         int64_t slots = 0;
         if (!strata::core::read_expert_profile(profile_in, r.c.g.n_layers, r.c.g.n_expert, prior, slots, err))
@@ -783,28 +952,26 @@ int main(int argc, char** argv) {
         std::printf("  expert cache: %d experts placed from %s (%zu ranked)\n", placed, profile_in.c_str(), prior.size());
     }
     if (!dump_routing.empty() && !(r.routing = std::fopen(dump_routing.c_str(), "wb"))) die("cannot write " + dump_routing);
+    if (serve_mode) {
+        // the server reads stdout for the protocol: the load report goes to stderr (the server's engine log)
+        std::fprintf(stderr, "glm_generate: loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
+        const int rc = serve(r, stop, seed);
+        if (r.routing) std::fclose(r.routing);
+        if (!profile_out.empty()) r.save_profile(profile_out, prior);
+        return rc;
+    }
     std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
     std::fflush(stdout);
 
     std::mt19937_64 rng(seed);
     const int64_t V = r.head.n_out;
     std::vector<float> lg((size_t) V);
+    Sampling sp;
+    sp.temp = temp;
     auto pick = [&]() -> int32_t {
         CK(cudaMemcpyAsync(lg.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost, g_st));
         CK(cudaStreamSynchronize(g_st));
-        int64_t best = 0;
-        for (int64_t i = 1; i < V; ++i)
-            if (lg[(size_t) i] > lg[(size_t) best]) best = i;
-        if (!std::isfinite(lg[(size_t) best])) die("the logits are not finite");
-        if (temp <= 0) return (int32_t) best;
-        double sum = 0;
-        std::vector<double> p((size_t) V);
-        for (int64_t i = 0; i < V; ++i) sum += (p[(size_t) i] = std::exp((lg[(size_t) i] - lg[(size_t) best]) / temp));
-        std::uniform_real_distribution<double> u(0.0, sum);
-        double t = u(rng);
-        for (int64_t i = 0; i < V; ++i)
-            if ((t -= p[(size_t) i]) <= 0) return (int32_t) i;
-        return (int32_t) best;
+        return sample(lg, sp, rng);
     };
 
     const auto tp = std::chrono::steady_clock::now();

@@ -4680,6 +4680,18 @@ def end_token_ids(tokenizer) -> set[int]:
         eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
         if eos is not None:
             ids.add(int(eos))
+    # GLM-5 (a tokenizer whose <|im_end|> is not one token, so never a Qwen one): a turn ends at its end-of-turn ids the GGUF
+    # names (tokenizer.ggml.eot_token_id / eom_token_id) and where the model opens the next turn, <|user|> or <|observation|>
+    # (a tool result), each one token there.  A Qwen tokenizer's set is the one above, unchanged.
+    if len(tokenizer.encode(IM_END, parse_special=True)) != 1:
+        sp = getattr(tokenizer, "special_ids", None) or {}
+        for key, v in sp.items():
+            if v is not None and key.endswith(("eos_token_id", "eot_token_id", "eom_token_id")):
+                ids.add(int(v))
+        for marker in ("<|user|>", "<|observation|>"):
+            got = tokenizer.encode(marker, parse_special=True)
+            if len(got) == 1:
+                ids.add(int(got[0]))
     return ids
 
 
