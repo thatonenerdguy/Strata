@@ -1220,7 +1220,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = mff(e, t);
                     if (narithmetic_ == NativeArithmetic::WindowInvariant)
                         native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                     else
@@ -1233,7 +1233,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                                 mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 } else {
                     const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = mhq(e, t);
                     if (narithmetic_ == NativeArithmetic::WindowInvariant)
                         native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                     else
@@ -1355,6 +1355,18 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
+    // a layer wider than the fixed arrays (another family): runtime-sized intermediates, allocated on first use
+    if (f.n_ff > FF || f.h_bytes > kNativeHBytes) {
+        if (q2_native_kernels(f.gu_type) || q2_native_kernels(f.d_type)) {
+            std::fprintf(stderr, "strata: a native Q2_0 layer wider than the compiled shape is not supported\n");
+            std::abort();
+        }
+        wide_ff_n_ = f.n_ff;
+        wide_hb_ = (f.h_bytes + 63) & ~(size_t) 63;
+        const size_t cells = (size_t) kMaxSplitMulti * MAXT;
+        if (wide_ff_.size() < cells * (size_t) wide_ff_n_) wide_ff_.resize(cells * (size_t) wide_ff_n_);
+        if (wide_hq_.size() < cells * wide_hb_) wide_hq_.resize(cells * wide_hb_);
+    }
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
@@ -1369,7 +1381,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                else native_quant_h(f, mff(e, t), mhq(e, t));
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
@@ -1381,6 +1393,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
+    wide_ff_n_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 

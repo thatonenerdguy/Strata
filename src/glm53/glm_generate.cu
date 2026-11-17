@@ -92,7 +92,7 @@ struct Layer {
     const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
     size_t egsz = 0, edsz = 0;
     K::NativeExpertLayout L;
-    KC::NativeFmt fmt, f_gate, f_up, f_down;   // the CPU's view: gate / up / down rows as row-dot "down" formats
+    KC::NativeFmt fmt;   // the CPU's view (Strata's ExpertPool), with the layer's SwiGLU clamp
     float lim_exp = 0, lim_sh = 0;
 };
 
@@ -149,86 +149,12 @@ struct ExpertCache {
     }
 };
 
-/// A fixed set of worker threads for the CPU experts: run(n, f) calls f(0..n-1) spread over the workers and the caller.
-class Workers {
-public:
-    /// `n` threads besides the caller; with `cores` (Strata's physical_cores order), worker i is pinned to
-    /// cores[i + 1] and the caller should sit on cores[0] - one thread per physical core, as the engine's pool does.
-    explicit Workers(int n, const std::vector<int>& cores = {}) {
-        for (int i = 0; i < n; ++i) {
-            const int core = i + 1 < (int) cores.size() ? cores[(size_t) i + 1] : -1;
-            th_.emplace_back([this, core] {
-                if (core >= 0) KC::pin_current_thread(core);
-                loop();
-            });
-        }
-    }
-    ~Workers() {
-        {
-            std::lock_guard<std::mutex> g(m_);
-            stop_ = true;
-            ++epoch_;
-        }
-        cv_.notify_all();
-        for (auto& t : th_) t.join();
-    }
-    int size() const { return (int) th_.size() + 1; }
-    void run(int n, const std::function<void(int)>& f) {
-        {
-            std::lock_guard<std::mutex> g(m_);
-            fn_ = &f;
-            n_ = n;
-            next_.store(0);
-            done_.store(0);
-            ++epoch_;
-        }
-        cv_.notify_all();
-        work();
-        std::unique_lock<std::mutex> g(m_);
-        done_cv_.wait(g, [&] { return done_.load() >= n_; });
-        fn_ = nullptr;
-    }
-
-private:
-    void work() {
-        for (;;) {
-            const int i = next_.fetch_add(1);
-            if (i >= n_) return;
-            (*fn_)(i);
-            if (done_.fetch_add(1) + 1 == n_) {
-                std::lock_guard<std::mutex> g(m_);
-                done_cv_.notify_all();
-            }
-        }
-    }
-    void loop() {
-        uint64_t seen = 0;
-        for (;;) {
-            {
-                std::unique_lock<std::mutex> g(m_);
-                cv_.wait(g, [&] { return epoch_ != seen; });
-                seen = epoch_;
-                if (stop_) return;
-                if (!fn_) continue;
-            }
-            work();
-        }
-    }
-    std::vector<std::thread> th_;
-    std::mutex m_;
-    std::condition_variable cv_, done_cv_;
-    const std::function<void(int)>* fn_ = nullptr;
-    std::atomic<int> n_{0};
-    std::atomic<int> next_{0}, done_{0};
-    uint64_t epoch_ = 0;
-    bool stop_ = false;
-};
-
-
 struct Runner {
     Ctx c;
     bool cpu_experts = true;
-    std::unique_ptr<Workers> workers;
+    std::unique_ptr<KC::ExpertPool> pool;   // Strata's CPU expert pool: one pinned worker per physical core
+    std::vector<KC::NativeFmt> job_fmt;     // per job: the gate rows are the blob, up and down at their distance
+    std::vector<KC::ExpertJobMulti> jobs;
     float* h_x = nullptr;       // pinned: the layer's normed input on the host
     float* h_parts = nullptr;   // pinned: the CPU experts' output rows
     int64_t n_cpu = 0, n_gpu = 0;
@@ -334,19 +260,9 @@ struct Runner {
                     die(b + " the expert blob layout does not match the tensors");
                 if (cpu_experts) {
                     std::string e2;
-                    // native_fmt also refuses activations larger than the engine pool's fixed buffers (sized for the
-                    // compiled model); act_bytes and h_bytes are filled just before that check, and this tool sizes
-                    // its own buffers from them, so only a failure before them stops it.
-                    if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2) &&
-                        (y.fmt.act_bytes == 0 || y.fmt.h_bytes == 0))
-                        die(b + " CPU experts: " + e2);
-                    // gate and up rows as a "down" of n_embd inputs at offset 0 of their own tensor slice
-                    y.f_gate = y.fmt;
-                    y.f_gate.d_type = y.fmt.gu_type, y.f_gate.d_act = y.fmt.gu_act, y.f_gate.d_row = y.fmt.gu_row;
-                    y.f_gate.n_ff = N, y.f_gate.down_off = 0, y.f_gate.tail_off = 0;
-                    y.f_up = y.f_gate;
-                    y.f_down = y.fmt;
-                    y.f_down.down_off = 0, y.f_down.tail_off = 0;
+                    // pool_bounds false: the pool gives a layer wider than the compiled shape runtime-sized scratch
+                    if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2, false)) die(b + " CPU experts: " + e2);
+                    y.fmt.swiglu_limit = y.lim_exp;
                 }
             }
             if (l % 5 == 4 || l + 1 == g.n_layers) {
@@ -410,7 +326,7 @@ struct Runner {
         CK(cudaMallocHost(&h_x, (size_t) N * 4));
         CK(cudaMallocHost(&h_parts, (size_t) (Kx * N) * 4));
         if (cpu_experts)
-            std::printf("  CPU experts: %d threads (the experts not in the cache run on the CPU)\n", workers->size());
+            std::printf("  CPU experts (the ones not in the cache): Strata's pool, %s\n", pool->placement_line().c_str());
         std::printf("  expert cache: %d slots of %.1f MB (%.2f GB); %zu experts per layer x %lld MoE layers in RAM\n",
                     cache.n, cache.slot / 1e6, (double) cache.n * cache.slot / 1e9, (size_t) g.n_expert,
                     (long long) (g.n_layers - g.n_dense_lead));
@@ -527,39 +443,27 @@ struct Runner {
         proj(wd, t0, dst);
     }
 
-    /// One CPU expert's output row (n_embd) into dst: gate / up rows, the clamped SwiGLU, the down rows; the rows
-    /// split into tasks over the workers.  `act` is x quantized for the gate/up rows.
+    /// The CPU's experts through Strata's ExpertPool (run_split_multi_native: every expert's rows split across all the
+    /// pinned threads, gate/up, the clamped SwiGLU, the down rows).  The three expert tensors are read in place, as
+    /// the engine's 149-cold mode reads a GGUF: the gate rows are the job's blob, up and down at their distance.
     void cpu_experts_run(const Layer& y, const std::vector<int>& es, const void* act, const std::vector<float*>& dst) {
-        const int64_t N = c.g.n_embd, F = y.fmt.n_ff;
-        const int M = (int) es.size();
-        constexpr int kRows = 64;
-        std::vector<std::vector<float>> gt((size_t) M, std::vector<float>((size_t) F)), ut = gt;
-        const int gu_tasks = (int) ((F + kRows - 1) / kRows);
-        workers->run(M * gu_tasks * 2, [&](int i) {
-            const int m = i / (2 * gu_tasks), r = i % (2 * gu_tasks), up = r >= gu_tasks, r0 = (r % gu_tasks) * kRows;
-            const int r1 = (int) std::min<int64_t>(F, r0 + kRows);
-            const uint8_t* blob = (up ? y.eu : y.eg) + (size_t) es[(size_t) m] * y.egsz;
-            float* o = (up ? ut : gt)[(size_t) m].data();
-            KC::native_down_rows(up ? y.f_up : y.f_gate, blob, &act, 1, &o, r0, r1);
-        });
-        const size_t hb = y.fmt.h_bytes;
-        std::vector<uint8_t> hq((size_t) M * hb);
-        for (int m = 0; m < M; ++m) {
-            float* g = gt[(size_t) m].data();
-            for (int64_t r = 0; r < F; ++r) {
-                float a = g[r], u = ut[(size_t) m][(size_t) r];
-                if (y.lim_exp > 1e-6f) a = std::min(a, y.lim_exp), u = std::max(-y.lim_exp, std::min(u, y.lim_exp));
-                g[r] = a / (1.0f + std::exp(-a)) * u;
-            }
-            KC::native_quant_h(y.fmt, g, hq.data() + (size_t) m * hb);
+        const size_t M = es.size();
+        job_fmt.resize(M);
+        jobs.assign(M, KC::ExpertJobMulti{});
+        for (size_t m = 0; m < M; ++m) {
+            const uint8_t* g = y.eg + (size_t) es[m] * y.egsz;
+            KC::NativeFmt& f = job_fmt[m];
+            f = y.fmt;
+            f.up_off = (size_t) ((uintptr_t) (y.eu + (size_t) es[m] * y.egsz) - (uintptr_t) g);   // modular, as 149-cold
+            f.down_off = (size_t) ((uintptr_t) (y.ed + (size_t) es[m] * y.edsz) - (uintptr_t) g);
+            KC::ExpertJobMulti& jb = jobs[m];
+            jb.blob = g;
+            jb.nt = 1;
+            jb.nact[0] = act;
+            jb.out[0] = dst[m];
+            jb.fmt = &f;
         }
-        const int d_tasks = (int) ((N + 4 * kRows - 1) / (4 * kRows));
-        workers->run(M * d_tasks, [&](int i) {
-            const int m = i / d_tasks, r0 = (i % d_tasks) * 4 * kRows, r1 = (int) std::min<int64_t>(N, r0 + 4 * kRows);
-            const void* h = hq.data() + (size_t) m * hb;
-            float* o = dst[(size_t) m];
-            KC::native_down_rows(y.f_down, y.ed + (size_t) es[(size_t) m] * y.edsz, &h, 1, &o, r0, r1);
-        });
+        pool->run_split_multi_native(y.fmt, jobs.data(), (int) M);
     }
 
     void moe(Layer& y, int64_t l) {
@@ -743,14 +647,11 @@ int main(int argc, char** argv) {
     r.cpu_experts = cpu_exp != 0;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
-        // Strata's own topology: one logical processor per physical core (pool.hpp physical_cores), the main
-        // thread on the first and a pinned worker on each of the rest; --threads N takes the first N of them
-        // (more than there are physical cores: the extra threads run unpinned)
-        std::vector<int> cores = KC::physical_cores(false);
-        const int n = threads > 0 ? threads : std::max(1, (int) cores.size());
-        if ((int) cores.size() > n) cores.resize((size_t) n);
-        if (!cores.empty()) KC::pin_current_thread(cores[0]);
-        r.workers = std::make_unique<Workers>(n - 1, cores);
+        // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
+        // thread goes; it works in the drain too); --threads N asks for N threads in all, as --pool-workers N - 1
+        const int host = KC::planned_host_core();
+        if (host >= 0) KC::pin_current_thread(host);
+        r.pool = std::make_unique<KC::ExpertPool>(threads > 1 ? threads - 1 : 0);
     }
     std::string err;
     if (!strata::core::glm5_geometry_from_gguf(gm.meta(), r.c.g, err)) die(err);

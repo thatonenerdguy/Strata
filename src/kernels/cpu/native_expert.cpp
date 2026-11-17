@@ -259,7 +259,7 @@ bool iq256_supported(int type) noexcept {
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, bool pool_bounds) {
     init_once();
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
@@ -304,7 +304,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     }
     f.act_bytes = row_size_of(vdt_g, n_embd);
     f.h_bytes = row_size_of(vdt_d, n_ff);
-    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+    if (pool_bounds && (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes)) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
@@ -455,9 +455,45 @@ int native_gu_mt_min(int gu_type) {
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
+/// GLM-5 (NativeFmt::swiglu_limit > 0): gate and up rows on ggml-cpu's dot, each token alone (so a token's rows do
+/// not depend on the group, under either arithmetic), then h = silu(min(g, L)) * clamp(u, -L, L), as llama.cpp's
+/// glm5-next and the GPU's swiglu_clamp_entries_kernel clamp.  NVFP4's tail scales apply as in
+/// the other paths; the trellis types have no ggml dot and are refused.
+static void native_gu_rows_clamped(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt,
+                                   float* const* ff, int r0, int r1) {
+    if (tq_supported(f.gu_type)) {
+        std::fprintf(stderr, "strata: the SwiGLU clamp has no trellis (type %d) rows\n", f.gu_type);
+        std::abort();
+    }
+    float sg = 1.f, su = 1.f;
+    if (f.tail_off) {
+        std::memcpy(&sg, blob + f.tail_off, sizeof sg);
+        std::memcpy(&su, blob + f.tail_off + sizeof(float), sizeof su);
+    }
+    const Tr dot = traits(f.gu_type);
+    const int n = (int) f.n_embd;
+    const float L = f.swiglu_limit;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gr = blob + (size_t) r * f.gu_row;
+        const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        for (int t = 0; t < nt; ++t) {
+            float g = 0.f, u = 0.f;
+            dot.dot(n, &g, gr, act[t]);
+            dot.dot(n, &u, ur, act[t]);
+            g = std::min(g * sg, L);
+            u = std::max(-L, std::min(u * su, L));
+            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+        }
+    }
+}
+
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.swiglu_limit > 0.f) {   // GLM-5's clamp (NativeFmt::swiglu_limit); 0 for every other family
+        native_gu_rows_clamped(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the

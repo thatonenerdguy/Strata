@@ -369,6 +369,19 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // A native layer wider than the compiled shape (another family's experts, e.g. GLM-5.3-Flash's n_ff 2048): its
+    // intermediates and down activations live in these runtime-sized arrays instead of split_multi_'s fixed ones.
+    // wide_ff_n_ == 0 (every layer of the compiled shape): untouched, and the fixed arrays are used as always.
+    int64_t wide_ff_n_ = 0;
+    size_t wide_hb_ = 0;
+    std::vector<float> wide_ff_;
+    std::vector<uint8_t> wide_hq_;
+    float* mff(int e, int t) {
+        return wide_ff_n_ ? wide_ff_.data() + ((size_t) e * MAXT + (size_t) t) * (size_t) wide_ff_n_ : split_multi_[(size_t) e].ff[t];
+    }
+    uint8_t* mhq(int e, int t) {
+        return wide_ff_n_ ? wide_hq_.data() + ((size_t) e * MAXT + (size_t) t) * wide_hb_ : split_multi_[(size_t) e].hq[t];
+    }
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own
