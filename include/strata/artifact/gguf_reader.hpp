@@ -664,6 +664,30 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// GLM-5.3-Flash's guard (`glm5-next`, after llama.cpp's llama_model_glm5_next::load_arch_hparams): every key llama.cpp
+/// requires must be present, as a number or (the per-layer keys) an array of numbers.  The full geometry and layout
+/// checks are core::glm5_geometry_from_gguf and core::check_glm5_layout (core/glm5_layout.hpp).
+inline std::string check_architecture_glm5next(const GgufFile& g) {
+    static const char* const keys[] = {
+        "block_count", "embedding_length", "feed_forward_length", "attention.head_count", "attention.head_count_kv",
+        "attention.layer_norm_rms_epsilon", "attention.key_length_mla", "attention.value_length_mla",
+        "attention.q_lora_rank", "attention.kv_lora_rank", "ssm.conv_kernel", "kda.head_dim", "expert_count",
+        "expert_used_count", "expert_feed_forward_length", "expert_shared_count", "attention.indexer.head_count",
+        "attention.indexer.key_length", "attention.indexer.top_k", "attention.indexer.kpool", "hyper_connection.count",
+        "hyper_connection.sinkhorn_iterations", "hyper_connection.epsilon",
+    };
+    for (const char* k : keys) {
+        const std::string key = std::string("glm5-next.") + k;
+        const MetaValue* v = g.get(key);
+        if (!v) return "missing " + key;
+        if (v->is_num()) continue;
+        if (v->type != MetaType::ARRAY || v->count == 0) return key + " is not a number";
+        for (const MetaValue& e : v->items)
+            if (!e.is_num()) return key + " is not a number or an array of numbers";
+    }
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +875,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Glm5Next) return check_architecture_glm5next(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
