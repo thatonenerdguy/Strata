@@ -154,6 +154,83 @@ struct ExpertCache {
     }
 };
 
+/// The prompt path's experts (a step of --stream-min tokens or more): the experts the step routes to that are not in the
+/// VRAM cache go up to the GPU in groups, as Strata's engine streams a prompt chunk's experts through its ring
+/// (src/prefill/prefill.cpp, step 3): copier threads gather a group's blobs from the mapped file into a pinned buffer
+/// while the GPU multiplies the group before; one DMA per group into a VRAM staging buffer; native_expert_grouped then
+/// runs the group as it runs the cached experts.  Two buffers each side, events between them.  A chunk's experts are
+/// read once from RAM whatever its length, where the CPU path's work grows with the tokens.
+struct Streamer {
+    int G = 16;                       // experts a group
+    size_t slot = 0;                  // bytes an expert takes (the cache's slot: gate | up | down at the layout's offsets)
+    uint8_t *host[2] = {}, *dev[2] = {};
+    cudaStream_t cs = nullptr;
+    cudaEvent_t dma[2] = {}, comp[2] = {};
+    int64_t experts = 0;
+    double bytes = 0, secs = 0;
+    // copier threads: run(n, fn) calls fn(0..n-1) on them and on the caller
+    std::vector<std::thread> th;
+    std::mutex m;
+    std::condition_variable cv, done;
+    std::function<void(int)> job;
+    std::atomic<int> next{0};
+    int n_items = 0, busy = 0;
+    uint64_t gen = 0;
+    bool quit = false;
+
+    bool on() const { return host[0] != nullptr; }
+    void start(int groups_of, size_t slot_bytes, int threads) {
+        G = groups_of, slot = slot_bytes;
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaMallocHost(&host[b], (size_t) G * slot));
+            CK(cudaMalloc(&dev[b], (size_t) G * slot));
+            CK(cudaEventCreateWithFlags(&dma[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&comp[b], cudaEventDisableTiming));
+        }
+        CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaEventRecord(dma[b], cs));
+            CK(cudaEventRecord(comp[b], cs));
+        }
+        for (int i = 0; i < threads; ++i) th.emplace_back([this] { loop(); });
+    }
+    void drain() {
+        for (int i; (i = next.fetch_add(1)) < n_items;) job(i);
+    }
+    void loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return quit || gen != seen; });
+                if (quit) return;
+                seen = gen;
+            }
+            drain();
+            std::lock_guard<std::mutex> lk(m);
+            if (--busy == 0) done.notify_one();
+        }
+    }
+    void run(int n, std::function<void(int)> fn) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            job = std::move(fn), n_items = n, next = 0, busy = (int) th.size(), ++gen;
+        }
+        cv.notify_all();
+        drain();
+        std::unique_lock<std::mutex> lk(m);
+        done.wait(lk, [&] { return busy == 0; });
+    }
+    ~Streamer() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            quit = true;
+        }
+        cv.notify_all();
+        for (auto& t : th) t.join();
+    }
+};
+
 struct Runner {
     Ctx c;
     bool cpu_experts = true;
@@ -163,6 +240,9 @@ struct Runner {
     float* h_x = nullptr;       // pinned: the layer's normed inputs on the host [chunk][n_embd]
     float* h_parts = nullptr;   // pinned: the CPU experts' output rows [chunk][k][n_embd]
     int chunk = 1;              // tokens a step() takes at most (--prompt-chunk); every buffer below holds this many
+    int stream_min = 0;         // --stream-min: a step of this many tokens or more streams its experts to the GPU (0: never)
+    int stream_threads = 8;
+    Streamer streamer;
     int64_t n_cpu = 0, n_gpu = 0;
     double cpu_s = 0;
     std::vector<double> heat;        // routing count of every (layer, expert), for --expert-profile-save
@@ -326,6 +406,11 @@ struct Runner {
         CK(cudaMalloc(&d_ed, (size_t) (T * Kx) * 4));
         CK(cudaMalloc(&d_et, (size_t) (T * Kx) * 4));
 
+        if (stream_min > 0 && chunk >= stream_min) {
+            streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads);
+            std::printf("  prompt steps of %d+ tokens stream their experts: 2 x %d slots pinned and in VRAM (%.2f GB each side), "
+                        "%d copier threads\n", stream_min, streamer.G, 2.0 * streamer.G * streamer.slot / 1e9, stream_threads);
+        }
         // the expert cache: what is asked, or what is free minus 1 GB
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
@@ -517,6 +602,84 @@ struct Runner {
         pool->run_split_multi_native(y.fmt, jobs.data(), (int) n_jobs);
     }
 
+    /// Token t's q8_1 at t * N / 32 blocks, as native_expert_grouped reads them.
+    void quantize_tokens(int T) {
+        const int64_t N = c.g.n_embd;
+        for (int c0 = 0; c0 < T; c0 += 8)
+            K::native_quantize_q8_1(xn + (size_t) c0 * N, (uint8_t*) xq + (size_t) c0 * (N / 32) * 36, (int) N,
+                                    std::min(8, T - c0), g_st);
+    }
+
+    /// native_expert_grouped over experts at the given VRAM addresses, each with its (token, entry) pairs, into parts.
+    /// The tables go up on g_st, so a later call's tables never overwrite ones a launch still reads.
+    void run_grouped(const Layer& y, const std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>>& gpu) {
+        std::vector<unsigned long long> gp;
+        std::vector<int32_t> gs, ed, et;
+        for (const auto& gr : gpu) {
+            gp.push_back((unsigned long long) gr.first);
+            gs.push_back((int32_t) ed.size());
+            for (const auto& te : gr.second) et.push_back(te.first), ed.push_back(te.second);
+        }
+        const int32_t ng = (int32_t) gp.size();
+        if (ng == 0) return;
+        n_gpu += (int64_t) ed.size();
+        gs.push_back((int32_t) ed.size());
+        CK(cudaMemcpyAsync(d_gp, gp.data(), gp.size() * 8, cudaMemcpyHostToDevice, g_st));
+        CK(cudaMemcpyAsync(d_gs, gs.data(), gs.size() * 4, cudaMemcpyHostToDevice, g_st));
+        CK(cudaMemcpyAsync(d_ng, &ng, 4, cudaMemcpyHostToDevice, g_st));
+        CK(cudaMemcpyAsync(d_ed, ed.data(), ed.size() * 4, cudaMemcpyHostToDevice, g_st));
+        CK(cudaMemcpyAsync(d_et, et.data(), et.size() * 4, cudaMemcpyHostToDevice, g_st));
+        K::native_expert_grouped(y.L, d_gp, d_gs, d_ng, d_ed, d_et, ng, (int64_t) ed.size(), xq, escr, parts, g_st);
+    }
+
+    /// A long step's experts (see Streamer): the cached ones in place, the rest streamed up in groups.
+    void moe_streamed(const Layer& y, int64_t l, int T, const std::vector<int32_t>& ids) {
+        const int64_t E = c.g.n_expert, Kx = c.g.n_expert_used;
+        const auto t0c = std::chrono::steady_clock::now();
+        std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> res;
+        std::vector<std::pair<int, std::vector<std::pair<int, int>>>> str;
+        std::unordered_map<int, size_t> res_at, str_at;
+        for (int t = 0; t < T; ++t)
+            for (int64_t k = 0; k < Kx; ++k) {
+                const int en = (int) (t * Kx + k), e = ids[(size_t) en];
+                auto ri = res_at.find(e);
+                if (ri != res_at.end()) { ++cache.hits, res[ri->second].second.push_back({t, en}); continue; }
+                auto si = str_at.find(e);
+                if (si != str_at.end()) { str[si->second].second.push_back({t, en}); continue; }
+                if (uint8_t* slot = cache.find(l, e, E)) {
+                    res_at[e] = res.size();
+                    res.push_back({slot, {{t, en}}});
+                } else {
+                    str_at[e] = str.size();
+                    str.push_back({e, {{t, en}}});
+                }
+            }
+        quantize_tokens(T);
+        run_grouped(y, res);
+        Streamer& S = streamer;
+        for (size_t g0 = 0, i = 0; g0 < str.size(); g0 += (size_t) S.G, ++i) {
+            const int b = (int) (i & 1), n = (int) std::min(str.size() - g0, (size_t) S.G);
+            CK(cudaEventSynchronize(S.dma[b]));          // the pinned buffer's last DMA is done
+            S.run(n, [&](int q) {
+                const int e = str[g0 + (size_t) q].first;
+                uint8_t* d = S.host[b] + (size_t) q * S.slot;
+                std::memcpy(d, y.eg + (size_t) e * y.egsz, y.egsz);
+                std::memcpy(d + y.L.up_off, y.eu + (size_t) e * y.egsz, y.egsz);
+                std::memcpy(d + y.L.down_off, y.ed + (size_t) e * y.edsz, y.edsz);
+            });
+            CK(cudaStreamWaitEvent(S.cs, S.comp[b], 0));   // the VRAM buffer's last group is multiplied
+            CK(cudaMemcpyAsync(S.dev[b], S.host[b], (size_t) n * S.slot, cudaMemcpyHostToDevice, S.cs));
+            CK(cudaEventRecord(S.dma[b], S.cs));
+            CK(cudaStreamWaitEvent(g_st, S.dma[b], 0));
+            std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> grp;
+            for (int q = 0; q < n; ++q) grp.push_back({S.dev[b] + (size_t) q * S.slot, str[g0 + (size_t) q].second});
+            run_grouped(y, grp);
+            CK(cudaEventRecord(S.comp[b], g_st));
+            S.experts += n, S.bytes += (double) n * (2 * y.egsz + y.edsz);
+        }
+        S.secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count();
+    }
+
     void moe(Layer& y, int64_t l, int T) {
         const auto& g = c.g;
         const int64_t N = g.n_embd, E = g.n_expert, Kx = g.n_expert_used;
@@ -538,6 +701,14 @@ struct Runner {
                 std::fwrite(ids.data() + (size_t) t * Kx, sizeof(int32_t), (size_t) Kx, routing);
                 std::fwrite(wts.data() + (size_t) t * Kx, sizeof(float), (size_t) Kx, routing);
             }
+        if (stream_min > 0 && T >= stream_min && streamer.on()) {
+            moe_streamed(y, l, T, ids);
+            float* shared = t3;
+            dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared, T);
+            K::native_moe_combine_multi(parts, dw, shared, out, N, Kx, T, g_st);
+            CK(cudaStreamSynchronize(g_st));
+            return;
+        }
         // entry t * Kx + k (token t's k-th pick) -> that row of parts.  The picks in the cache (or that fill a free slot)
         // run on the GPU, grouped by expert; the rest on the CPU, one job per expert for all its tokens.
         std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> gpu;   // slot -> (token, entry)
@@ -570,28 +741,12 @@ struct Runner {
                     cpu_tok[(size_t) t] = 1;
                 }
             }
-        std::vector<unsigned long long> gp;
-        std::vector<int32_t> gs, ed, et;
-        for (const auto& gr : gpu) {
-            gp.push_back((unsigned long long) gr.first);
-            gs.push_back((int32_t) ed.size());
-            for (const auto& te : gr.second) et.push_back(te.first), ed.push_back(te.second);
-        }
         int64_t on_cpu = 0;
         for (const auto& cr : cpu) on_cpu += (int64_t) cr.second.size();
-        n_gpu += (int64_t) ed.size(), n_cpu += on_cpu;
-        const int32_t ng = (int32_t) gp.size();
-        if (ng > 0) {
-            gs.push_back((int32_t) ed.size());
-            CK(cudaMemcpyAsync(d_gp, gp.data(), gp.size() * 8, cudaMemcpyHostToDevice, g_st));
-            CK(cudaMemcpyAsync(d_gs, gs.data(), gs.size() * 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaMemcpyAsync(d_ng, &ng, 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaMemcpyAsync(d_ed, ed.data(), ed.size() * 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaMemcpyAsync(d_et, et.data(), et.size() * 4, cudaMemcpyHostToDevice, g_st));
-            for (int c0 = 0; c0 < T; c0 += 8)   // token t's q8_1 at t * N / 32 blocks, as native_expert_grouped reads them
-                K::native_quantize_q8_1(xn + (size_t) c0 * N, (uint8_t*) xq + (size_t) c0 * (N / 32) * 36, (int) N,
-                                        std::min(8, T - c0), g_st);
-            K::native_expert_grouped(y.L, d_gp, d_gs, d_ng, d_ed, d_et, ng, (int64_t) ed.size(), xq, escr, parts, g_st);
+        n_cpu += on_cpu;
+        if (!gpu.empty()) {
+            quantize_tokens(T);
+            run_grouped(y, gpu);
         }
         float* shared = t3;
         dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared, T);
@@ -865,7 +1020,7 @@ int main(int argc, char** argv) {
     int n_gen = 64;
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
-    int cpu_exp = 1, threads = 0, chunk = 32;
+    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8;
     bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
@@ -890,6 +1045,8 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save") profile_out = next();
         else if (a == "--dump-routing") dump_routing = next();
         else if (a == "--prompt-chunk") chunk = std::stoi(next());
+        else if (a == "--stream-min") stream_min = std::stoi(next());
+        else if (a == "--stream-threads") stream_threads = std::max(0, std::stoi(next()));
         else if (a == "--check-prompt") check_prompt = true;
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // the server adds options of its main engine (drafting, VRAM fit, ...): said and left out, never fatal
@@ -899,7 +1056,8 @@ int main(int argc, char** argv) {
             if (val) ++i;
         } else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
-                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 32] [--check-prompt]\n"
+                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 256] [--stream-min 64]\n"
+                 "  [--stream-threads 8] [--check-prompt]\n"
                  "  --serve (Strata's server protocol on stdin/stdout; --ctx / --max-context, --stop, --expert-profile*)");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
@@ -914,6 +1072,7 @@ int main(int argc, char** argv) {
     // the prompt in steps of `chunk` tokens; --cpu-experts 0 evicts cache slots, which a step's later picks could
     // still need, so it keeps one token a step
     r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 256)) : 1;
+    r.stream_min = stream_min, r.stream_threads = stream_threads;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
         // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
@@ -982,7 +1141,8 @@ int main(int argc, char** argv) {
     if (check_prompt) {
         // the same prompt again one token a step (the decode path): the batched step must give the same logits.  The
         // multi-column projections, the grouped experts and the pool's clamped rows are per-token exact, so the
-        // expectation is bit-identical; any difference is printed with its size.
+        // expectation is bit-identical with --stream-min 0; streamed steps run on the GPU the experts a single token
+        // runs on the CPU, so with streaming on the logits are close, not identical.  Any difference is printed with its size.
         std::vector<float> a((size_t) V), b((size_t) V);
         CK(cudaMemcpy(a.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
         r.reset();
@@ -1022,6 +1182,9 @@ int main(int argc, char** argv) {
                 "CPU experts (prompt included)\n",
                 (long long) r.n_gpu, (long long) r.cache.hits, (long long) r.cache.misses, (long long) r.n_cpu,
                 r.cache.copy_s, r.cpu_s);
+    if (r.streamer.experts)
+        std::printf("prompt streaming: %lld experts (%.1f GB) streamed in %.1f s of MoE (%.1f GB/s)\n", (long long) r.streamer.experts,
+                    r.streamer.bytes / 1e9, r.streamer.secs, r.streamer.bytes / 1e9 / std::max(r.streamer.secs, 1e-9));
     if (r.routing) std::fclose(r.routing);
     if (!profile_out.empty()) r.save_profile(profile_out, prior);
     return 0;

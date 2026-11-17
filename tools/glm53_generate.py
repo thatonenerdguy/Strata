@@ -36,7 +36,9 @@ def main() -> int:
                     help="expert profile: which experts start in VRAM, loaded if it exists and updated after every run "
                          "with what the run routed (default: strata-expert-profile.bin beside the model)")
     ap.add_argument("--no-profile", action="store_true", help="neither load nor save a profile")
-    ap.add_argument("--prompt-chunk", type=int, default=0, help="prompt tokens a step (0: the tool's default, 32; 1: one at a time)")
+    ap.add_argument("--prompt-chunk", type=int, default=0, help="prompt tokens a step (0: the tool's default, 256; 1: one at a time)")
+    ap.add_argument("--stream-min", type=int, default=-1, help="steps of this many tokens or more stream their experts to the GPU "
+                    "(-1: the tool's default, 64; 0: never, the CPU takes them)")
     ap.add_argument("--check-prompt", action="store_true", help="run the prompt batched and one at a time, compare the logits")
     ap.add_argument("--dump-routing", default="", help="write a routing trace for tools/make_profile.py --n-layer 45 --n-expert 288")
     ap.add_argument("--bin", default=str(HERE.parent / "build" / "glm_generate"))
@@ -75,6 +77,8 @@ def main() -> int:
         cmd += ["--expert-profile-save", str(prof)]
     if a.prompt_chunk > 0:
         cmd += ["--prompt-chunk", str(a.prompt_chunk)]
+    if a.stream_min >= 0:
+        cmd += ["--stream-min", str(a.stream_min)]
     if a.check_prompt:
         cmd += ["--check-prompt"]
     if a.dump_routing:
