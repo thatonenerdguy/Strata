@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/prefill/equal_cut_rule.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -954,9 +955,18 @@ struct Runner {
         pos += T;
     }
     /// The prompt from ids[from] on, `chunk` tokens a step; the last token's logits in `logits`.
+    /// The prompt in steps cut as Strata's engine cuts a segment (prefill/equal_cut_rule.hpp, one GPU): a prompt longer
+    /// than a step is read in n = ceil(tokens / chunk) steps of equal size, so no short remainder pays a full pass over the
+    /// streamed experts; a last step under the stream floor keeps full steps and a remainder.  STRATA_PREFILL_EQUAL=0: full
+    /// steps and a remainder, as before.
     void prompt(const std::vector<int32_t>& ids, size_t from = 0) {
-        for (size_t i = from; i < ids.size(); i += (size_t) chunk) {
-            const int T = (int) std::min<size_t>((size_t) chunk, ids.size() - i);
+        namespace EC = strata::prefill::equal_cut;
+        const int64_t tokens = (int64_t) (ids.size() - std::min(from, ids.size()));
+        const int64_t floor = stream_min > 0 ? stream_min : 1;
+        const int64_t step_n = std::max<int64_t>(1, std::min<int64_t>(
+            EC::chunk(EC::pick(std::getenv("STRATA_PREFILL_EQUAL"), true), tokens, chunk, floor), chunk));
+        for (size_t i = from; i < ids.size(); i += (size_t) step_n) {
+            const int T = (int) std::min<size_t>((size_t) step_n, ids.size() - i);
             step(ids.data() + i, T, i + (size_t) T == ids.size());
         }
     }
@@ -1264,7 +1274,7 @@ int main(int argc, char** argv) {
     const auto tp = std::chrono::steady_clock::now();
     r.prompt(prompt);
     const double prompt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
-    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s, %d a step)\n", prompt.size(), prompt_s, prompt.size() / prompt_s,
+    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s, steps of at most %d)\n", prompt.size(), prompt_s, prompt.size() / prompt_s,
                 r.chunk);
     if (check_prompt) {
         // the same prompt again one token a step (the decode path): the batched step must give the same logits.  The
