@@ -36,7 +36,7 @@ def main() -> int:
                     help="expert profile: which experts start in VRAM, loaded if it exists and updated after every run "
                          "with what the run routed (default: strata-expert-profile.bin beside the model)")
     ap.add_argument("--no-profile", action="store_true", help="neither load nor save a profile")
-    ap.add_argument("--prompt-chunk", type=int, default=0, help="prompt tokens a step (0: the tool's default, 256; 1: one at a time)")
+    ap.add_argument("--prompt-chunk", type=int, default=0, help="prompt tokens a step (0: the tool's default, up to 8192 with streaming, as large as the lent cache slots hold; 1: one at a time)")
     ap.add_argument("--stream-min", type=int, default=-1, help="steps of this many tokens or more stream their experts to the GPU "
                     "(-1: the tool's default, 64; 0: never, the CPU takes them)")
     ap.add_argument("--stream-threads", type=int, default=0, help="copier threads for the streamed experts (0: the tool's default, 8)")

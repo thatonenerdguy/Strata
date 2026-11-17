@@ -116,6 +116,53 @@ struct ExpertCache {
     std::vector<int> free_slots;
     int64_t hits = 0, misses = 0;
     double copy_s = 0;
+    // Strata's lend (prefill: "the prompt path borrowing expert-cache slots"): the last `lent` slots hold a long prompt's
+    // buffers while it is read; their experts leave the cache and come back afterwards
+    int lent = 0;
+    std::vector<std::pair<int, int64_t>> lent_keys;   // (slot, key) of the experts that left
+    double refill_s = 0;
+
+    /// The last L slots as one block of L * slot bytes.  Their experts leave the cache (kept to come back), the empty ones
+    /// leave the free list.  The caller has waited for every launch that could still read them.
+    uint8_t* lend(int L) {
+        lent = L;
+        lent_keys.clear();
+        for (auto it = where.begin(); it != where.end();) {
+            if (it->second.first >= n - L) {
+                lent_keys.push_back({it->second.first, it->first});
+                lru.erase(it->second.second);
+                it = where.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        free_slots.erase(std::remove_if(free_slots.begin(), free_slots.end(), [&](int s) { return s >= n - L; }),
+                         free_slots.end());
+        return base + (size_t) (n - L) * slot;
+    }
+    /// The lent slots back: each expert that left is copied into its own slot again (least recently used), the rest free.
+    void give_back(const std::vector<Layer>& layers, int64_t n_expert) {
+        if (lent == 0) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<char> filled((size_t) lent, 0);
+        for (const auto& sk : lent_keys) {
+            const Layer& ly = layers[(size_t) (sk.second / n_expert)];
+            const int e = (int) (sk.second % n_expert);
+            uint8_t* dst = base + (size_t) sk.first * slot;
+            CK(cudaMemcpyAsync(dst, ly.eg + (size_t) e * ly.egsz, ly.egsz, cudaMemcpyHostToDevice, g_st));
+            CK(cudaMemcpyAsync(dst + ly.L.up_off, ly.eu + (size_t) e * ly.egsz, ly.egsz, cudaMemcpyHostToDevice, g_st));
+            CK(cudaMemcpyAsync(dst + ly.L.down_off, ly.ed + (size_t) e * ly.edsz, ly.edsz, cudaMemcpyHostToDevice, g_st));
+            lru.push_back(sk.second);
+            where[sk.second] = {sk.first, std::prev(lru.end())};
+            filled[(size_t) (sk.first - (n - lent))] = 1;
+        }
+        for (int i = 0; i < lent; ++i)
+            if (!filled[(size_t) i]) free_slots.push_back(n - lent + i);
+        CK(cudaStreamSynchronize(g_st));
+        refill_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        lent = 0;
+        lent_keys.clear();
+    }
 
     /// The slot of an expert already cached (counts a hit), or null.
     uint8_t* find(int64_t layer, int e, int64_t n_expert) {
@@ -188,8 +235,7 @@ struct Streamer {
     void start(int groups_of, size_t slot_bytes, int threads, const KC::ThreadAffinity& cpus) {
         G = groups_of, slot = slot_bytes;
         for (int b = 0; b < NB; ++b) {
-            CK(cudaMallocHost(&host[b], (size_t) G * slot));
-            CK(cudaMalloc(&dev[b], (size_t) G * slot));
+            CK(cudaMallocHost(&host[b], (size_t) G * slot));   // dev[b]: in the prompt's (lent) buffers, see Runner::lay_out
             CK(cudaEventCreateWithFlags(&dma[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&comp[b], cudaEventDisableTiming));
         }
@@ -251,7 +297,12 @@ struct Runner {
     std::vector<KC::ExpertJobMulti> jobs;
     float* h_x = nullptr;       // pinned: the layer's normed inputs on the host [chunk][n_embd]
     float* h_parts = nullptr;   // pinned: the CPU experts' output rows [chunk][k][n_embd]
-    int chunk = 1;              // tokens a step() takes at most (--prompt-chunk); every buffer below holds this many
+    int chunk = 1;              // tokens a prompt step takes at most (--prompt-chunk)
+    int small_t = 1;            // tokens the standing buffers hold (decode, and steps under the stream floor)
+    int cap_t = 0;              // tokens the buffers in use hold (small_t, or a long prompt's step in lent slots)
+    int last_step = 0;          // the step size the last prompt() was cut to
+    int64_t big_a = 0, big_b = 0, max_ff = 0;   // widths: H x kv_lora (q_abs, o_lat), every other per-token buffer, the experts' n_ff
+    uint8_t* standing = nullptr;
     int stream_min = 0;         // --stream-min: a step of this many tokens or more streams its experts to the GPU (0: never)
     int stream_threads = 8;
     Streamer streamer;
@@ -311,6 +362,79 @@ struct Runner {
             if (!is_float_type(w.type)) K::native_quantize_q8_1(x0, xq, (int) w.n_in, nc, g_st);
             mv(w, x0, xq, o + (size_t) c0 * w.n_out, nc);
         }
+    }
+
+    /// The per-step buffers for T tokens carved from `base` (256-byte aligned pieces); returns their bytes.  With base
+    /// null only the size.  A long prompt's layout lives in lent cache slots, the standing one in its own block.
+    size_t lay_out(int64_t T, uint8_t* base) {
+        const auto& g = c.g;
+        const int64_t N = g.n_embd, Kx = g.n_expert_used;
+        size_t off = 0;
+        auto take = [&](size_t bytes) -> uint8_t* {
+            off = (off + 255) & ~(size_t) 255;
+            uint8_t* p = base ? base + off : nullptr;
+            off += bytes;
+            return p;
+        };
+        auto f32 = [&](int64_t n) { return (float*) take((size_t) n * 4); };
+        auto i32 = [&](int64_t n) { return (int32_t*) take((size_t) n * 4); };
+        const bool commit = base != nullptr;
+        void* xq_ = take(std::max(K::native_q8_1_bytes((int) ((big_b + 255) / 256 * 256), 8), (size_t) T * (size_t) (N / 32) * 36));
+        float *s1 = f32(T * 4 * N), *s2 = f32(T * 4 * N), *hc = f32(T * 24), *x_ = f32(T * N), *xn_ = f32(T * N), *out_ = f32(T * N);
+        float* tt[8];
+        for (int i = 0; i < 8; ++i) tt[i] = f32(T * (i == 2 || i == 5 ? std::max(big_a, big_b) : big_b));
+        int32_t *tok_ = i32(T), *ids_ = i32(T * Kx);
+        float* w_ = f32(T * Kx);
+        void* escr_ = take(K::native_expert_scratch_bytes(T * Kx, max_ff));
+        float* parts_ = f32(T * Kx * N);
+        auto* gp_ = (unsigned long long*) take((size_t) (T * Kx) * 8);
+        int32_t *gs_ = i32(T * Kx + 1), *ng_ = i32(1), *ed_ = i32(T * Kx), *et_ = i32(T * Kx);
+        uint16_t *p16_ = nullptr, *xn16_ = nullptr;
+        if (gemm_ok && T >= kGemmProjMin) p16_ = (uint16_t*) take((size_t) (T * big_b) * 2), xn16_ = (uint16_t*) take((size_t) (T * N) * 2);
+        uint8_t* sdev[Streamer::NB] = {};
+        if (streamer.on() && stream_min > 0 && T >= stream_min)
+            for (auto& d : sdev) d = take((size_t) streamer.G * streamer.slot);
+        if (commit) {
+            xq = xq_, streams = s1, streams2 = s2, hcw = hc, x = x_, xn = xn_, out = out_;
+            t0 = tt[0], t1 = tt[1], t2 = tt[2], t3 = tt[3], t4 = tt[4], t5 = tt[5], t6 = tt[6], t7 = tt[7];
+            dtok = tok_, dids = ids_, dw = w_, escr = escr_, parts = parts_, d_gp = gp_, d_gs = gs_, d_ng = ng_, d_ed = ed_, d_et = et_;
+            p16 = p16_, xn16 = xn16_;
+            for (int b = 0; b < Streamer::NB; ++b) streamer.dev[b] = sdev[b];
+            cap_t = (int) T;
+        }
+        return off;
+    }
+
+    /// A prompt step of T tokens needs more than the standing buffers: lend cache slots for a layout of T, or of the most
+    /// tokens the cache can lend for (it keeps n_expert_used slots for a short remainder's experts; a lent layout is a
+    /// streamed one, so never under --stream-min).  Returns the tokens the lent layout holds, or small_t when nothing
+    /// was lent.
+    int lend_slots(int t) { return (int) ((lay_out(t, nullptr) + cache.slot - 1) / cache.slot); }
+    /// The most tokens (up to T) a lent layout can hold, or small_t when the cache cannot lend for one.
+    int lend_most(int T) {
+        const int can = cache.n - (int) c.g.n_expert_used;
+        int lo = std::max(small_t + 1, stream_min), hi = T;
+        if (lo > hi || lend_slots(lo) > can) return small_t;
+        while (lo < hi) {   // the most tokens whose layout fits
+            const int mid = lo + (hi - lo + 1) / 2;
+            if (lend_slots(mid) <= can) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
+    }
+    int begin_lend(int T) {
+        const int t = lend_most(T);
+        if (t <= small_t) return small_t;
+        CK(cudaStreamSynchronize(g_st));   // nothing still reads the experts that leave
+        lay_out(t, cache.lend(lend_slots(t)));
+        return t;
+    }
+    /// Back to the standing buffers; the lent slots get their experts back.
+    void end_lend() {
+        if (cache.lent == 0) return;
+        CK(cudaStreamSynchronize(g_st));
+        lay_out(small_t, standing);
+        cache.give_back(layers, c.g.n_expert);
     }
 
     void load(double cache_gb) {
@@ -410,33 +534,25 @@ struct Runner {
         std::printf("  embedding %s, head %s (%s); %.2f GB of weights in VRAM\n", te.type_name(),
                     strata::ggml_type_name(head.type), head.path(), g_vram / 1e9);
 
-        // activations
-        const int64_t big = std::max<int64_t>({N, g.kda_inner(), g.n_head * g.value_length_mla, g.n_ff, g.n_head * g.kv_lora,
-                                               g.q_lora, g.idx_heads * g.idx_key_dim, g.n_ff_exp * g.n_expert_shared});
-        const int64_t T = chunk, Kx = g.n_expert_used;
-        // q8_1 activations: 8 columns of the widest projection input, or the whole step's tokens for the experts
-        xq = dbytes(std::max(K::native_q8_1_bytes((int) ((big + 255) / 256 * 256), 8), (size_t) T * (size_t) (N / 32) * 36));
-        streams = dalloc((size_t) (T * 4 * N)), streams2 = dalloc((size_t) (T * 4 * N)), hcw = dalloc((size_t) (T * 24));
-        x = dalloc((size_t) (T * N)), xn = dalloc((size_t) (T * N)), out = dalloc((size_t) (T * N));
-        for (float** p : {&t0, &t1, &t2, &t3, &t4, &t5, &t6, &t7}) *p = dalloc((size_t) (T * big));
+        // activations: H x kv_lora wide for q_abs / o_lat (t2, t5), the widest other row for the rest
+        big_a = g.n_head * g.kv_lora;
+        big_b = std::max<int64_t>({N, g.kda_inner(), g.n_head * g.value_length_mla, g.n_head * g.key_length_mla, g.n_ff,
+                                   g.q_lora, g.idx_heads * g.idx_key_dim, g.n_ff_exp * g.n_expert_shared, g.n_expert});
+        const int64_t Kx = g.n_expert_used;
+        // the standing buffers hold the steps under the stream floor (decode, a short remainder); a longer prompt step
+        // lays its buffers out in lent cache slots (begin_lend).  Without streaming, the standing buffers take a full step.
+        const bool lending = stream_min > 0 && chunk >= stream_min;
+        small_t = lending ? std::max(1, stream_min - 1) : chunk;
+        const int64_t T = small_t;
         logits = dalloc((size_t) head.n_out);
         score = dalloc((size_t) (ctx_max / g.idx_kpool + 1));
         scr = (float*) dbytes((size_t) K::glm_mla_attend_scratch_bytes((int) g.n_head, ctx_max));
-        CK(cudaMalloc(&dtok, (size_t) T * 4));
         dcells_cap = (size_t) ctx_max;
         CK(cudaMalloc(&dcells, dcells_cap * 4));
-        CK(cudaMalloc(&dids, (size_t) (T * Kx) * 4));
-        dw = dalloc((size_t) (T * Kx));
         size_t maxF = 0, maxblob = 0;
         for (const Layer& y : layers)
             if (!y.dense) maxF = std::max(maxF, (size_t) y.L.n_ff), maxblob = std::max(maxblob, y.L.bytes);
-        escr = dbytes(K::native_expert_scratch_bytes(T * Kx, (int64_t) maxF));
-        parts = dalloc((size_t) (T * Kx * N));
-        CK(cudaMalloc(&d_gp, (size_t) (T * Kx) * 8));
-        CK(cudaMalloc(&d_gs, (size_t) (T * Kx + 1) * 4));
-        CK(cudaMalloc(&d_ng, 4));
-        CK(cudaMalloc(&d_ed, (size_t) (T * Kx) * 4));
-        CK(cudaMalloc(&d_et, (size_t) (T * Kx) * 4));
+        max_ff = (int64_t) maxF;
 
         if (stream_min > 0 && chunk >= stream_min) {
             streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads, unpinned);
@@ -450,15 +566,18 @@ struct Runner {
             gemm_ok = gemm.init(g_st, (int64_t) 32 << 20, gerr);   // the engine's GEMM_SCRATCH: every projection in one piece
             if (!gemm_ok) std::printf("  prompt GEMMs off: %s\n", gerr.c_str());
             else {
-                p16 = (uint16_t*) dbytes((size_t) (T * big) * 2);
-                xn16 = (uint16_t*) dbytes((size_t) (T * N) * 2), x16 = (uint16_t*) dbytes((size_t) (R * N) * 2);
-                h16 = (uint16_t*) dbytes((size_t) (R * F) * 2);
-                yg = dalloc((size_t) (R * F)), yu = dalloc((size_t) (R * F)), yd = dalloc((size_t) (R * N));
-                CK(cudaMalloc(&d_src, (size_t) (2 * R) * 4));   // a batch's source rows, then its entries
+                if (gemm_min > 0) {   // the expert GEMMs' batch buffers (off by default)
+                    x16 = (uint16_t*) dbytes((size_t) (R * N) * 2), h16 = (uint16_t*) dbytes((size_t) (R * F) * 2);
+                    yg = dalloc((size_t) (R * F)), yu = dalloc((size_t) (R * F)), yd = dalloc((size_t) (R * N));
+                    CK(cudaMalloc(&d_src, (size_t) (2 * R) * 4));   // a batch's source rows, then its entries
+                }
                 std::printf("  prompt steps: projections over %d+ tokens and experts with %d+ rows each as FP16 tensor-core GEMMs "
                             "(Strata's prefill Gemm)\n", kGemmProjMin, gemm_min);
             }
         }
+        const size_t sb = lay_out(T, nullptr);
+        standing = (uint8_t*) dbytes(sb);
+        lay_out(T, standing);
         // the expert cache: what is asked, or what is free minus 1 GB
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
@@ -476,6 +595,16 @@ struct Runner {
         std::printf("  expert cache: %d slots of %.1f MB (%.2f GB); %zu experts per layer x %lld MoE layers in RAM\n",
                     cache.n, cache.slot / 1e6, (double) cache.n * cache.slot / 1e9, (size_t) g.n_expert,
                     (long long) (g.n_layers - g.n_dense_lead));
+        if (lending) {
+            const int most = lend_most(chunk);
+            if (most > small_t)
+                std::printf("  standing buffers: %d tokens (%.2f GB); a prompt step lends cache slots for its buffers and refills "
+                            "them after, as Strata's prompt path does: up to %d tokens a step (%d of %d slots, %.2f GB)\n",
+                            small_t, sb / 1e9, most, lend_slots(most), cache.n, lend_slots(most) * (double) cache.slot / 1e9);
+            else
+                std::printf("  standing buffers: %d tokens (%.2f GB); the cache is too small to lend for a streamed step\n",
+                            small_t, sb / 1e9);
+        }
     }
 
     void embed(const int32_t* toks, int T) {
@@ -817,7 +946,9 @@ struct Runner {
                                    (float) g.expert_weights_scale, T, g_st);
         std::vector<int32_t> ids((size_t) (T * Kx));
         CK(cudaMemcpyAsync(ids.data(), dids, ids.size() * 4, cudaMemcpyDeviceToHost, g_st));
-        if (cpu_experts) CK(cudaMemcpyAsync(h_x, xn, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, g_st));
+        const bool streamed = stream_min > 0 && T >= stream_min && streamer.on();
+        // the CPU experts' inputs (h_x holds the standing buffers' small_t tokens: a streamed step needs none)
+        if (cpu_experts && !streamed) CK(cudaMemcpyAsync(h_x, xn, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, g_st));
         std::vector<float> wts(routing ? (size_t) (T * Kx) : 0);
         if (routing) CK(cudaMemcpyAsync(wts.data(), dw, wts.size() * 4, cudaMemcpyDeviceToHost, g_st));
         CK(cudaStreamSynchronize(g_st));
@@ -829,7 +960,7 @@ struct Runner {
                 std::fwrite(ids.data() + (size_t) t * Kx, sizeof(int32_t), (size_t) Kx, routing);
                 std::fwrite(wts.data() + (size_t) t * Kx, sizeof(float), (size_t) Kx, routing);
             }
-        if (stream_min > 0 && T >= stream_min && streamer.on()) {
+        if (streamed) {
             moe_streamed(y, l, T, ids);
             float* shared = t3;
             dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared, T);
@@ -932,7 +1063,7 @@ struct Runner {
     void step(const int32_t* toks, int T, bool want_logits) {
         const auto& g = c.g;
         const int64_t N = g.n_embd;
-        if (T < 1 || T > chunk) die("step: bad token count");
+        if (T < 1 || T > cap_t) die("step: bad token count");
         embed(toks, T);
         for (int64_t l = 0; l < g.n_layers; ++l) {
             Layer& y = layers[(size_t) l];
@@ -963,12 +1094,19 @@ struct Runner {
         namespace EC = strata::prefill::equal_cut;
         const int64_t tokens = (int64_t) (ids.size() - std::min(from, ids.size()));
         const int64_t floor = stream_min > 0 ? stream_min : 1;
-        const int64_t step_n = std::max<int64_t>(1, std::min<int64_t>(
-            EC::chunk(EC::pick(std::getenv("STRATA_PREFILL_EQUAL"), true), tokens, chunk, floor), chunk));
+        const auto equal = EC::pick(std::getenv("STRATA_PREFILL_EQUAL"), true);
+        auto cut = [&](int64_t most) { return std::max<int64_t>(1, std::min<int64_t>(EC::chunk(equal, tokens, most, floor), most)); };
+        int64_t step_n = cut(chunk);
+        if (step_n > small_t) {   // a long step: its buffers in lent cache slots, cut again to what they hold
+            const int cap = begin_lend((int) step_n);
+            if (cap < step_n) step_n = cut(cap);
+        }
+        last_step = (int) step_n;
         for (size_t i = from; i < ids.size(); i += (size_t) step_n) {
             const int T = (int) std::min<size_t>((size_t) step_n, ids.size() - i);
             step(ids.data() + i, T, i + (size_t) T == ids.size());
         }
+        end_lend();
     }
     /// Back to position 0 with empty recurrent states (--check-prompt runs the prompt twice).  The caches past pos
     /// are never read before they are written again.
@@ -1157,7 +1295,7 @@ int main(int argc, char** argv) {
     int n_gen = 64;
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
-    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8, gemm_min = 0;
+    int cpu_exp = 1, threads = 0, chunk = 0, stream_min = 64, stream_threads = 8, gemm_min = 0;
     bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
@@ -1194,7 +1332,7 @@ int main(int argc, char** argv) {
             if (val) ++i;
         } else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
-                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 256] [--stream-min 64]\n"
+                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 0 (auto)] [--stream-min 64]\n"
                  "  [--stream-threads 8] [--gemm-min-rows 0] [--check-prompt]\n"
                  "  --serve (Strata's server protocol on stdin/stdout; --ctx / --max-context, --stop, --expert-profile*)");
     }
@@ -1209,7 +1347,10 @@ int main(int argc, char** argv) {
     r.cpu_experts = cpu_exp != 0;
     // the prompt in steps of `chunk` tokens; --cpu-experts 0 evicts cache slots, which a step's later picks could
     // still need, so it keeps one token a step
-    r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 2048)) : 1;
+    // --prompt-chunk 0 (the default): as Strata's --prefill auto, steps of up to 8192 tokens when they stream their
+    // experts (each step lends what it can of the cache for its buffers), else 256
+    if (chunk <= 0) chunk = stream_min > 0 ? 8192 : 256;
+    r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 8192)) : 1;
     r.stream_min = stream_min, r.stream_threads = stream_threads, r.gemm_min = gemm_min;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
@@ -1274,8 +1415,8 @@ int main(int argc, char** argv) {
     const auto tp = std::chrono::steady_clock::now();
     r.prompt(prompt);
     const double prompt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
-    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s, steps of at most %d)\n", prompt.size(), prompt_s, prompt.size() / prompt_s,
-                r.chunk);
+    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s, steps of %d tokens; %.2f s of it refilling the lent cache slots)\n",
+                prompt.size(), prompt_s, prompt.size() / prompt_s, r.last_step, r.cache.refill_s);
     if (check_prompt) {
         // the same prompt again one token a step (the decode path): the batched step must give the same logits.  The
         // multi-column projections, the grouped experts and the pool's clamped rows are per-token exact, so the
