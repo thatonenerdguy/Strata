@@ -22,7 +22,6 @@
 #include "strata/kernels/glm_router.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pin_budget.hpp"
-#include "strata/core/pinned.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -34,9 +33,6 @@
 #include "gguf_dev.cuh"
 
 #include <atomic>
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -107,6 +103,7 @@ struct Layer {
     FMat probs_b;
     const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
     size_t egsz = 0, edsz = 0;
+    bool pinned = false;   // the three expert tensors are page-locked (cudaHostRegister): the GPU reads them directly
     K::NativeExpertLayout L;
     KC::NativeFmt fmt;   // the CPU's view (Strata's ExpertPool), with the layer's SwiGLU clamp
     float lim_exp = 0, lim_sh = 0;
@@ -315,19 +312,9 @@ struct Runner {
     // --pin-experts: page-lock the MoE layers' expert tensors in the mapped file (cudaHostRegister, read-only), as
     // Strata pins its expert arena, while the RAM left stays over --pin-reserve-gb; a streamed step's experts then go up
     // by DMA straight from them.  The copier threads' gather was RAM-bound at ~12 GB/s on a 3060 box.
-    int pin_experts = 1;           // 0 off, 1 in the background (load returns at once), 2 before load returns
+    bool pin_experts = false;   // off by default: registering the mapped file costs ~4 min at load (89.7 GB on a 3060 box)
     double pin_reserve_gb = 16;
-    std::unique_ptr<std::atomic<bool>[]> layer_pinned;   // per layer: its expert tensors are page-locked (set once, by the pinner)
-    std::vector<std::unique_ptr<strata::core::PinnedArena>> arenas;   // per MoE layer: its experts, pinned (Strata's arena)
-    std::thread pinner;
-    std::atomic<bool> pin_quit{false};
-    std::atomic<int> pin_layers{0};
-    std::atomic<double> pinned_gb{0}, pin_s{0};
-    ~Runner() {
-        pin_quit = true;
-        if (pinner.joinable()) pinner.join();   // the registration in flight finishes first
-    }
-    bool layer_is_pinned(int64_t l) const { return layer_pinned && layer_pinned[(size_t) l].load(std::memory_order_acquire); }
+    double pinned_bytes = 0, pin_s = 0;
     // the prompt path's many-row experts as tensor-core GEMMs (Strata's prefill Gemm::native: the GGUF blocks dequantized
     // to FP16, cuBLAS), --gemm-min-rows: a group of experts averaging this many rows or more (0: never)
     int gemm_min = 0;   // off by default: on an RTX 3060, 45.3 tok/s without against 43.1 with (1887 tokens)
@@ -468,100 +455,74 @@ struct Runner {
             if (k == key) return kb * 1024 / 1e9;
         return 0;
     }
-    /// Strata's expert arena, a layer at a time: each MoE layer's three expert tensors are copied out of the mapped file
-    /// into a PinnedArena (anonymous memory registered with CUDA BEFORE any page is touched, as core/pinned.cu does:
-    /// registering pages already faulted in is far slower - pinning the mapped file in place cost 237 s for 89.7 GB and
-    /// held up every other CUDA call).  The layer's tensor pointers then move to the arena (the CPU pool, the cache and the
-    /// streamer all read them), its streamed experts go up by direct DMA, and the file's pages it left are paged out, so
-    /// the RAM holds one copy.  On a thread (--pin-experts 1, load returns at once; 2 waits), layer by layer in model
-    /// order, while the arenas stay under MemTotal - --pin-reserve-gb and the RAM available over the reserve.
+    /// Page-lock the MoE layers' expert tensors (gate, up, down), as Strata's pin_blobs: the ranges rounded out to whole
+    /// pages (which stay inside the mapping), merged where they touch, so no page is registered twice and no blob spans two
+    /// registrations.  A region is registered whole while the pinned total stays under MemTotal - --pin-reserve-gb and
+    /// the RAM available over the reserve.  A layer whose tensors are all in registered regions streams by direct DMA; the
+    /// others keep the copier threads' gather.
     void pin_expert_tensors() {
-        layer_pinned.reset(new std::atomic<bool>[layers.size()]);
-        for (size_t l = 0; l < layers.size(); ++l) layer_pinned[l] = false;
-        arenas.resize(layers.size());
-        const int64_t E = c.g.n_expert;
-        double want = 0;
-        int n_moe = 0;
-        for (const Layer& y : layers)
-            if (!y.dense && y.eg != nullptr) ++n_moe, want += (double) (2 * y.egsz + y.edsz) * (double) E;
-        int dev = 0;
+        int dev = 0, ro = 0;
         CK(cudaGetDevice(&dev));
-        const KC::ThreadAffinity cpus = unpinned;
-        const int fill_threads = std::max(1, stream_threads);
-        auto work = [this, E, n_moe, dev, cpus, fill_threads] {
-            if (cpus.valid) KC::restore_thread_affinity(cpus);
-            (void) cudaSetDevice(dev);   // a new thread starts on device 0
-            const double total = mem_gb("MemTotal:");
-            const auto t0 = std::chrono::steady_clock::now();
-            double bytes_in = 0;
-            const char* stop = nullptr;
-            std::vector<std::pair<uintptr_t, uintptr_t>> left;   // the file ranges the last layer left, paged out after the next
-            auto page_out = [&] {
-#if defined(__linux__) && defined(MADV_PAGEOUT)
-                for (const auto& [a0, e0] : left) (void) madvise((void*) a0, e0 - a0, MADV_PAGEOUT);
-#endif
-                left.clear();
-            };
-            for (size_t l = 0; l < layers.size() && !stop; ++l) {
-                Layer& y = layers[l];
-                if (y.dense || y.eg == nullptr) continue;
-                if (pin_quit) { stop = "the exit"; break; }
-                const size_t g = y.egsz * (size_t) E, d = y.edsz * (size_t) E;
-                const size_t up_at = (g + 4095) & ~(size_t) 4095, down_at = up_at + ((g + 4095) & ~(size_t) 4095);
-                const size_t bytes = down_at + d;
-                const double avail = mem_gb("MemAvailable:");
-                if (total > 0 && (bytes_in + (double) bytes) / 1e9 > total - pin_reserve_gb) { stop = "the reserve"; break; }
-                if (avail > 0 && avail - (double) bytes / 1e9 < pin_reserve_gb) { stop = "the RAM available"; break; }
-                auto ar = std::make_unique<strata::core::PinnedArena>((uint64_t) bytes);
-                if (!ar->valid() || ar->registered_bytes < bytes) {
-                    (void) cudaGetLastError();
-                    stop = "a refused registration";
-                    break;
-                }
-                uint8_t* base = ar->data();
-                // fill: the three tensors in 64 MB pieces over fill_threads threads
-                struct Piece { uint8_t* dst; const uint8_t* src; size_t n; };
-                std::vector<Piece> pieces;
-                const size_t P = (size_t) 64 << 20;
-                for (auto [dst, src, n] : {Piece{base, y.eg, g}, Piece{base + up_at, y.eu, g}, Piece{base + down_at, y.ed, d}})
-                    for (size_t o = 0; o < n; o += P) pieces.push_back({dst + o, src + o, std::min(P, n - o)});
-                std::atomic<size_t> next{0};
-                std::vector<std::thread> th;
-                for (int i = 0; i < fill_threads; ++i)
-                    th.emplace_back([&, cpus] {
-                        if (cpus.valid) KC::restore_thread_affinity(cpus);
-                        for (size_t k; (k = next.fetch_add(1)) < pieces.size();) std::memcpy(pieces[k].dst, pieces[k].src, pieces[k].n);
-                    });
-                for (auto& t : th) t.join();
-                page_out();   // the layer before's file pages: its readers moved to its arena a layer ago
-                for (auto [a0, n] : {std::pair<const uint8_t*, size_t>{y.eg, g}, {y.eu, g}, {y.ed, d}})
-                    left.push_back({(uintptr_t) a0 & ~(uintptr_t) 4095, ((uintptr_t) a0 + n + 4095) & ~(uintptr_t) 4095});
-                // publish: the readers take the arena from here on (a reader still on the file reads the same bytes)
-                __atomic_store_n(&y.eg, (const uint8_t*) base, __ATOMIC_RELEASE);
-                __atomic_store_n(&y.eu, (const uint8_t*) (base + up_at), __ATOMIC_RELEASE);
-                __atomic_store_n(&y.ed, (const uint8_t*) (base + down_at), __ATOMIC_RELEASE);
-                arenas[l] = std::move(ar);
-                layer_pinned[l].store(true, std::memory_order_release);
-                ++pin_layers;
-                bytes_in += (double) bytes;
-                pinned_gb = bytes_in / 1e9;
-            }
-            if (!stop) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                page_out();
-            }
-            pin_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::fprintf(stderr, "glm_generate: expert arena (Strata's pinned arena): %d of %d MoE layers (%.1f GB) copied out of "
-                         "the file and pinned for direct DMA in %.1f s%s%s\n", pin_layers.load(), n_moe, bytes_in / 1e9,
-                         pin_s.load(), stop ? "; stopped by " : "", stop ? stop : "");
-        };
-        if (pin_experts >= 2) {
-            work();
+        if (cudaDeviceGetAttribute(&ro, cudaDevAttrHostRegisterReadOnlySupported, dev) != cudaSuccess || !ro) {
+            (void) cudaGetLastError();
+            std::printf("  expert tensors not pinned: this GPU cannot register read-only host memory\n");
             return;
         }
-        std::printf("  expert arena: %d MoE layers (%.1f GB) being copied into pinned memory in the background for direct DMA "
-                    "(Strata's pinned arena); layers switch from the copier threads as theirs are done\n", n_moe, want / 1e9);
-        pinner = std::thread(work);
+        const int64_t E = c.g.n_expert;
+        auto tensors = [&](const Layer& y) {
+            return std::vector<std::pair<uintptr_t, uintptr_t>>{
+                {(uintptr_t) y.eg, (uintptr_t) (y.eg + y.egsz * (size_t) E)},
+                {(uintptr_t) y.eu, (uintptr_t) (y.eu + y.egsz * (size_t) E)},
+                {(uintptr_t) y.ed, (uintptr_t) (y.ed + y.edsz * (size_t) E)}};
+        };
+        std::vector<std::pair<uintptr_t, uintptr_t>> r;
+        int n_moe = 0;
+        for (const Layer& y : layers)
+            if (!y.dense && y.eg != nullptr) {
+                ++n_moe;
+                for (auto [a, e] : tensors(y)) r.push_back({a & ~(uintptr_t) 4095, (e + 4095) & ~(uintptr_t) 4095});
+            }
+        if (r.empty()) return;
+        std::sort(r.begin(), r.end());
+        size_t k = 0;
+        for (size_t i = 1; i < r.size(); ++i) {
+            if (r[i].first <= r[k].second) r[k].second = std::max(r[k].second, r[i].second);
+            else r[++k] = r[i];
+        }
+        r.resize(k + 1);
+        const double total = mem_gb("MemTotal:");
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::pair<uintptr_t, uintptr_t>> live;
+        const char* stop = nullptr;
+        for (const auto& [a, e] : r) {
+            const double bytes = (double) (e - a), avail = mem_gb("MemAvailable:");
+            if (total > 0 && (pinned_bytes + bytes) / 1e9 > total - pin_reserve_gb) { stop = "the reserve"; continue; }
+            if (avail > 0 && avail < pin_reserve_gb) { stop = "the RAM available"; continue; }
+            if (strata::core::pin_register((void*) a, (size_t) (e - a), cudaHostRegisterReadOnly | cudaHostRegisterPortable) !=
+                cudaSuccess) {
+                (void) cudaGetLastError();
+                stop = "a refused registration";
+                continue;
+            }
+            live.push_back({a, e});
+            pinned_bytes += bytes;
+        }
+        int n_pinned = 0;
+        for (Layer& y : layers) {
+            if (y.dense || y.eg == nullptr) continue;
+            bool all = true;
+            for (auto [a, e] : tensors(y)) {
+                bool in = false;
+                for (const auto& [la, le] : live) in = in || (a >= la && e <= le);
+                all = all && in;
+            }
+            y.pinned = all;
+            n_pinned += all;
+        }
+        pin_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  expert tensors pinned for direct DMA (Strata's pin_blobs): %d of %d MoE layers, %zu of %zu regions "
+                    "(%.1f GB) in %.1f s%s%s\n", n_pinned, n_moe, live.size(), r.size(), pinned_bytes / 1e9, pin_s,
+                    stop ? "; some skipped for " : "", stop ? stop : "");
     }
 
     void load(double cache_gb) {
@@ -1038,10 +999,9 @@ struct Runner {
             run_group(y, grp);
         }
         Streamer& S = streamer;
-        const bool pinned = layer_is_pinned(l);   // read once: the pinner may finish this layer mid-step
         for (size_t g0 = 0, i = 0; g0 < str.size(); g0 += (size_t) S.G, ++i) {
             const int b = (int) (i % (size_t) Streamer::NB), n = (int) std::min(str.size() - g0, (size_t) S.G);
-            if (pinned) {   // the tensors are page-locked: the copy engine reads each blob in place, no CPU gather
+            if (y.pinned) {   // the tensors are page-locked: the copy engine reads each blob in place, no CPU gather
                 CK(cudaStreamWaitEvent(S.cs, S.comp[b], 0));   // the VRAM buffer's last group is multiplied
                 for (int q = 0; q < n; ++q) {
                     const int e = str[g0 + (size_t) q].first;
@@ -1446,7 +1406,7 @@ int run(int argc, char** argv) {
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
     int cpu_exp = 1, threads = 0, chunk = 0, stream_min = 64, stream_threads = 8, gemm_min = 0;
-    int pin_experts = 1;
+    bool pin_experts = false;
     double pin_reserve_gb = 16;
     bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
@@ -1480,7 +1440,7 @@ int run(int argc, char** argv) {
         else if (a == "--pool-workers") threads = std::stoi(next()) + 1;   // strata's: the workers beside this thread
         else if (a == "--stream-min") stream_min = std::stoi(next());
         else if (a == "--stream-threads") stream_threads = std::max(0, std::stoi(next()));
-        else if (a == "--pin-experts") pin_experts = std::max(0, std::stoi(next()));
+        else if (a == "--pin-experts") pin_experts = std::stoi(next()) != 0;
         else if (a == "--pin-reserve-gb") pin_reserve_gb = std::max(0.0, std::stod(next()));
         else if (a == "--gemm-min-rows") gemm_min = std::max(0, std::stoi(next()));
         else if (a == "--check-prompt") check_prompt = true;
@@ -1624,14 +1584,11 @@ int run(int argc, char** argv) {
                 r.cache.copy_s, r.cpu_s);
     if (r.n_gemm) std::printf("prompt GEMMs: %lld expert rows\n", (long long) r.n_gemm);
     if (r.streamer.experts)
-        std::printf("prompt streaming: %lld experts (%.1f GB); %lld of them (%.1f GB) DMA'd straight from pinned RAM, queued "
-                    "behind the GPU's work (their time is in the step, not here); the rest gathered by the copier threads in "
-                    "%.1f s (%.1f GB/s), waiting for the PCIe copies %.1f s; %.1f s of MoE host time; expert arena: %d layers "
-                    "(%.1f GB) so far\n",
+        std::printf("prompt streaming: %lld experts (%.1f GB, %lld of them DMA'd straight from pinned RAM) streamed in %.1f s of "
+                    "MoE (%.1f GB/s); the copier threads %.1f s (%.1f GB/s), waiting for the PCIe copies %.1f s\n",
                     (long long) r.streamer.experts, r.streamer.bytes / 1e9, (long long) r.streamer.direct,
-                    r.streamer.direct_bytes / 1e9, r.streamer.copy_s,
-                    (r.streamer.bytes - r.streamer.direct_bytes) / 1e9 / std::max(r.streamer.copy_s, 1e-9), r.streamer.wait_s,
-                    r.streamer.secs, r.pin_layers.load(), r.pinned_gb.load());
+                    r.streamer.secs, r.streamer.bytes / 1e9 / std::max(r.streamer.secs, 1e-9), r.streamer.copy_s,
+                    (r.streamer.bytes - r.streamer.direct_bytes) / 1e9 / std::max(r.streamer.copy_s, 1e-9), r.streamer.wait_s);
     if (r.routing) std::fclose(r.routing);
     if (!profile_out.empty()) r.save_profile(profile_out, prior);
     return 0;

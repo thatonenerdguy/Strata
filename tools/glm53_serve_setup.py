@@ -70,7 +70,10 @@ def main() -> int:
     stops = stop_ids(tk)
     profile = model.parent / "strata-expert-profile.bin"   # the same file tools/glm53_generate.py keeps
     args = ["--native", str(model), "--max-context", str(a.ctx), "--stop", ",".join(map(str, stops)),
-            "--expert-profile", str(profile), "--expert-profile-save", str(profile)]
+            "--expert-profile", str(profile), "--expert-profile-save", str(profile),
+            # a server loads once: page-lock the expert tensors for direct DMA (prompt 45 -> 61 tok/s on an RTX 3060,
+            # ~4 minutes more at start)
+            "--pin-experts", "1"]
     if a.threads > 0:
         args += ["--threads", str(a.threads)]
     cfg = {
