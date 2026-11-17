@@ -1,12 +1,13 @@
 """tools/glm53_serve_setup.py - the run config that lets Strata's server (serve/server.py) run GLM-5.3-Flash.
 
-    python tools/glm53_serve_setup.py --model <any shard of the GGUF> [--out DIR] [--ctx 16384] [--bin build/glm_generate]
+    python tools/glm53_serve_setup.py --model <any shard of the GGUF> [--out DIR] [--ctx 16384] [--bin build/strata]
     python -m serve.server --engine strata --config DIR/strata-glm53.json --port 8080
 
 What it writes into DIR (default: a "strata-glm53" folder beside the model):
   tokenizer/            the model's tokenizer and chat template, read out of the GGUF by strata_tokenizer.extract (the
                         server never opens the weight shards for them)
-  strata-glm53.json     the run config: the engine is build/glm_generate in its --serve mode (the line protocol the
+  strata-glm53.json     the run config: the engine is build/strata (its family switch hands a glm5-next model to the GLM
+                        engine path, src/glm53; build/glm_generate is the same path on its own) in its --serve mode (the line protocol the
                         server speaks to every Strata engine), with the model's stop tokens and the expert profile beside
                         the model (read at start when it exists, written back at every stop, as the wrapper does)
 
@@ -45,7 +46,7 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="any shard of the GLM-5.3-Flash GGUF")
     ap.add_argument("--out", default="", help="folder for the config and the tokenizer (default: strata-glm53 beside the model)")
     ap.add_argument("--ctx", type=int, default=16384, help="context in tokens (default 16384)")
-    ap.add_argument("--bin", default=str(ROOT / "build" / "glm_generate"), help="the glm_generate program")
+    ap.add_argument("--bin", default="", help="the engine: build/strata (default), or build/glm_generate")
     ap.add_argument("--name", default="GLM-5.3-Flash", help="the model name the server lists")
     ap.add_argument("--threads", type=int, default=0, help="CPU expert threads (0: the pool's own choice)")
     a = ap.parse_args()
@@ -55,9 +56,12 @@ def main() -> int:
         raise SystemExit(f"{model}: no such file")
     out = pathlib.Path(a.out).expanduser().resolve() if a.out else model.parent / "strata-glm53"
     out.mkdir(parents=True, exist_ok=True)
-    exe = pathlib.Path(a.bin).expanduser().resolve()
+    if a.bin:
+        exe = pathlib.Path(a.bin).expanduser().resolve()
+    else:   # strata itself (the family switch); a build that has only glm_generate keeps working
+        exe = next((p for p in (ROOT / "build" / "strata", ROOT / "build" / "glm_generate") if p.exists()), ROOT / "build" / "strata")
     if not exe.exists():
-        print(f"note: {exe} does not exist yet (cmake --build build --target glm_generate)")
+        print(f"note: {exe} does not exist yet (cmake --build build --target strata)")
 
     cfg_tok = ST.extract(str(model), str(out))
     tk = ST.Tokenizer.from_gguf(str(model))
@@ -65,7 +69,7 @@ def main() -> int:
         raise SystemExit("the GGUF has no chat template (tokenizer.chat_template): the server needs one")
     stops = stop_ids(tk)
     profile = model.parent / "strata-expert-profile.bin"   # the same file tools/glm53_generate.py keeps
-    args = ["--model", str(model), "--max-context", str(a.ctx), "--stop", ",".join(map(str, stops)),
+    args = ["--native", str(model), "--max-context", str(a.ctx), "--stop", ",".join(map(str, stops)),
             "--expert-profile", str(profile), "--expert-profile-save", str(profile)]
     if a.threads > 0:
         args += ["--threads", str(a.threads)]

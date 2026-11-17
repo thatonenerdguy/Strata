@@ -1,7 +1,7 @@
 // tests/core/glm5_layout_test.cpp - GLM-5.3-Flash (`glm5-next`) on synthetic GGUFs: no model, no GPU.
 //
 //   * the family is recognised, the architecture guard accepts a file with every key llama.cpp requires and refuses
-//     one without, naming the key; the engine guard refuses it (no engine path yet) and says why;
+//     one without, naming the key; Flash-Next's engine guard refuses it (it has its own engine path, src/glm53) and says why;
 //   * glm5_geometry_from_gguf reads GLM-5.3-Flash's real metadata values (45 + 1 MTP layers, 34 KDA / 11 MLA on 3, 7,
 //     ..., 43, 288 experts top-8, 3 dense layers, mHC 4 streams);
 //   * the layout table, on a tiny file: a complete file passes (separate or fused KDA q/k/v), a wrong shape, a missing
@@ -194,8 +194,8 @@ int main(int argc, char** argv) {
         check(strata::check_architecture(b) == "missing glm5-next.kda.head_dim",
               "and refuses one without kda.head_dim, naming the key");
         const std::string e = strata::check_engine_architecture(a);
-        check(e.find("GLM-5.3-Flash") != std::string::npos && e.find("no engine") != std::string::npos,
-              "the engine guard refuses GLM-5.3-Flash: recognised, no engine yet");
+        check(e.find("GLM-5.3-Flash") != std::string::npos && e.find("own engine path") != std::string::npos,
+              "Flash-Next's engine guard refuses GLM-5.3-Flash and names its own engine path");
         C::ModelGeometry qg;
         int64_t k = 0;
         std::string err;

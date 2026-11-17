@@ -17,7 +17,7 @@ enum class ModelFamily {
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
     Glm5Next,    ///< GLM-5.3-Flash (llama.cpp's `glm5-next`): KDA + MLA with a k-pool indexer, mHC, sigmoid-routed MoE.
-                 ///< Recognised and its layout checked (core/glm5_layout.hpp); no engine path yet, so always refused
+                 ///< Its own engine path (src/glm53) in the CUDA build, which `strata` switches to as for Qwen3.6
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
@@ -65,8 +65,8 @@ inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
     if (f == ModelFamily::Glm5Next)
-        return "GLM-5.3-Flash (architecture 'glm5-next') is recognised, but Strata has no engine for it yet: the port is "
-               "in progress, and only the file's layout can be checked so far";
+        return "GLM-5.3-Flash (architecture 'glm5-next') runs on its own engine path in the NVIDIA (CUDA) build of Strata; "
+               "this build does not run it (or it reached Flash-Next's path: pass the model with --native or --model)";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
            "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
            "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";

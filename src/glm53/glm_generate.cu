@@ -14,6 +14,7 @@
 // native_expert_grouped; the others run on the CPU at the same time (ggml-cpu's dot products, a worker per core;
 // --cpu-experts 0 copies them into the cache instead).  The cache fills with the first experts used and then stays.  The indexer's top-k choice is made on the host.  Not yet:
 // the MTP drafter, speed work, the chat template (the wrapper's job).
+#include "strata/glm53/engine.hpp"
 #include "strata/glm53/mhc_ref.hpp"
 #include "strata/kernels/glm_kda.hpp"
 #include "strata/kernels/glm_mhc.hpp"
@@ -1280,8 +1281,6 @@ std::vector<int32_t> parse_ids(const std::string& s) {
     return v;
 }
 
-}  // namespace
-
 struct Sampling {
     double temp = 0, top_p = 1, min_p = 0;
     int top_k = 0;
@@ -1436,7 +1435,11 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
     }
 }
 
-int main(int argc, char** argv) {
+}  // namespace
+
+namespace strata::glm53 {
+
+int run(int argc, char** argv) {
     g_tool = "glm_generate";
     std::string model, ids_s, stop_s;
     int n_gen = 64;
@@ -1454,8 +1457,9 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) die("missing value after " + a);
             return argv[++i];
         };
+        if (i == 1 && a.rfind("--", 0) != 0 && a != "-V") continue;   // `strata generate ...`: the subcommand
         if (a == "--serve") serve_mode = true;
-        else if (a == "--model") model = next();
+        else if (a == "--model" || a == "--native") model = next();   // strata's flag names where they mean the same
         else if (a == "--ids") ids_s = next();
         else if (a == "--n") n_gen = std::stoi(next());
         else if (a == "--ctx" || a == "--max-context") ctx = std::stoll(next());
@@ -1468,7 +1472,12 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") profile_in = next();
         else if (a == "--expert-profile-save") profile_out = next();
         else if (a == "--dump-routing") dump_routing = next();
-        else if (a == "--prompt-chunk") chunk = std::stoi(next());
+        else if (a == "--prompt-chunk" || a == "--chunk") chunk = std::stoi(next());
+        else if (a == "--prefill") {   // strata's --prefill auto | N
+            const std::string v = next();
+            chunk = v == "auto" ? 0 : std::stoi(v);
+        }
+        else if (a == "--pool-workers") threads = std::stoi(next()) + 1;   // strata's: the workers beside this thread
         else if (a == "--stream-min") stream_min = std::stoi(next());
         else if (a == "--stream-threads") stream_threads = std::max(0, std::stoi(next()));
         else if (a == "--pin-experts") pin_experts = std::max(0, std::stoi(next()));
@@ -1627,3 +1636,5 @@ int main(int argc, char** argv) {
     if (!profile_out.empty()) r.save_profile(profile_out, prior);
     return 0;
 }
+
+}  // namespace strata::glm53
