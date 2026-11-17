@@ -5,6 +5,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
@@ -123,6 +125,23 @@ void glm_swiglu_clamp(const float* gate, const float* up, float* out, int64_t n,
         throw std::invalid_argument("glm_swiglu_clamp: a stream and aligned buffers");
     swiglu_clamp_k<<<(unsigned) ((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, out, n, limit);
     check_launch("glm_swiglu_clamp");
+}
+
+namespace {
+__global__ void scatter_rows_k(const float* src, const int32_t* idx, int64_t width, float* dst) {
+    const int64_t r = blockIdx.y;
+    const float* s = src + r * width;
+    float* d = dst + (int64_t) idx[r] * width;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < width; i += (int64_t) gridDim.x * blockDim.x) d[i] = s[i];
+}
+}  // namespace
+
+void glm_scatter_rows(const float* src, const int32_t* idx, int64_t n, int64_t width, float* dst, void* stream) {
+    if (n < 1) return;
+    if (!stream || n > 65535) throw std::invalid_argument("glm_scatter_rows: a stream and at most 65535 rows");
+    const unsigned bx = (unsigned) std::min<int64_t>((width + 255) / 256, 16);
+    scatter_rows_k<<<dim3(bx, (unsigned) n), 256, 0, static_cast<cudaStream_t>(stream)>>>(src, idx, width, dst);
+    check_launch("glm_scatter_rows");
 }
 
 }  // namespace strata::kernels

@@ -23,6 +23,8 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/prefill/gemm.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include "gguf_dev.cuh"
 
@@ -43,6 +45,7 @@
 
 using namespace glm53_dev;
 namespace KC = strata::kernels::cpu;
+namespace PF = strata::prefill;
 
 namespace {
 
@@ -249,6 +252,17 @@ struct Runner {
     int stream_min = 0;         // --stream-min: a step of this many tokens or more streams its experts to the GPU (0: never)
     int stream_threads = 8;
     Streamer streamer;
+    // the prompt path's many-row experts as tensor-core GEMMs (Strata's prefill Gemm::native: the GGUF blocks dequantized
+    // to FP16, cuBLAS), --gemm-min-rows: a group of experts averaging this many rows or more (0: never)
+    int gemm_min = 8;
+    PF::Gemm gemm;
+    bool gemm_ok = false;
+    static constexpr int64_t kGemmRows = 2048;   // rows a GEMM batch takes at most (its buffers' size)
+    uint16_t *xn16 = nullptr, *x16 = nullptr, *h16 = nullptr, *p16 = nullptr;
+    static constexpr int kGemmProjMin = 32;      // a projection over this many tokens or more is a GEMM (with gemm_ok)
+    float *yg = nullptr, *yu = nullptr, *yd = nullptr;
+    int32_t *d_src = nullptr, *d_ent = nullptr;
+    int64_t n_gemm = 0;
     KC::ThreadAffinity unpinned;   // this thread's CPUs before it was pinned: the copier threads run on all of them
     int64_t n_cpu = 0, n_gpu = 0;
     double cpu_s = 0;
@@ -282,6 +296,11 @@ struct Runner {
     /// o[t] = W in[t] for T tokens (rows of n_in in, of n_out out), 8 columns a launch: native_mmvq's multi-column
     /// layout gives every column the bits of a single-column call, so a batch changes no value.
     void proj(const DMat& w, const float* in, float* o, int T = 1) {
+        if (gemm_ok && T >= kGemmProjMin && !is_float_type(w.type)) {   // a prompt step: one tensor-core GEMM (FP16)
+            PF::to_f16(in, p16, (int64_t) T * w.n_in, g_st);
+            gemm.native(p16, (int) w.type, w.w, o, T, w.n_out, w.n_in);
+            return;
+        }
         for (int c0 = 0; c0 < T; c0 += 8) {
             const int nc = std::min(8, T - c0);
             const float* x0 = in + (size_t) c0 * w.n_in;
@@ -419,6 +438,22 @@ struct Runner {
             streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads, unpinned);
             std::printf("  prompt steps of %d+ tokens stream their experts: 2 x %d slots pinned and in VRAM (%.2f GB each side), "
                         "%d copier threads\n", stream_min, streamer.G, 2.0 * streamer.G * streamer.slot / 1e9, stream_threads);
+        }
+        if (gemm_min > 0 && chunk >= kGemmProjMin) {
+            const int64_t R = kGemmRows, F = (int64_t) maxF;
+            std::string gerr;
+            gemm_ok = gemm.init(g_st, (int64_t) 32 << 20, gerr);   // the engine's GEMM_SCRATCH: every projection in one piece
+            if (!gemm_ok) std::printf("  prompt GEMMs off: %s\n", gerr.c_str());
+            else {
+                p16 = (uint16_t*) dbytes((size_t) (T * big) * 2);
+                xn16 = (uint16_t*) dbytes((size_t) (T * N) * 2), x16 = (uint16_t*) dbytes((size_t) (R * N) * 2);
+                h16 = (uint16_t*) dbytes((size_t) (R * F) * 2);
+                yg = dalloc((size_t) (R * F)), yu = dalloc((size_t) (R * F)), yd = dalloc((size_t) (R * N));
+                CK(cudaMalloc(&d_src, (size_t) R * 4));
+                CK(cudaMalloc(&d_ent, (size_t) R * 4));
+                std::printf("  prompt steps: projections over %d+ tokens and experts with %d+ rows each as FP16 tensor-core GEMMs "
+                            "(Strata's prefill Gemm)\n", kGemmProjMin, gemm_min);
+            }
         }
         // the expert cache: what is asked, or what is free minus 1 GB
         size_t fr = 0, tot = 0;
@@ -662,6 +697,54 @@ struct Runner {
         K::native_expert_grouped(y.L, d_gp, d_gs, d_ng, d_ed, d_et, ng, (int64_t) ed.size(), xq, escr, parts, g_st);
     }
 
+    /// Experts at VRAM addresses (each with its (token, entry) pairs) as GEMMs: a batch's rows gathered as FP16 (from xn16,
+    /// this step's normed inputs), gate and up per expert by Gemm::native, the clamped SwiGLU over the batch, down per
+    /// expert, the rows scattered to their places in parts.  Batches of at most kGemmRows rows; an expert with more is
+    /// split (its rows are independent).
+    void run_gemm(const Layer& y, const std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>>& grp) {
+        const int64_t N = c.g.n_embd, F = y.L.n_ff;
+        struct Piece { const uint8_t* w; int64_t r0, n; };
+        std::vector<Piece> pcs;
+        std::vector<int32_t> src, ent;
+        auto flush = [&]() {
+            const int64_t R = (int64_t) src.size();
+            if (R == 0) return;
+            CK(cudaMemcpyAsync(d_src, src.data(), (size_t) R * 4, cudaMemcpyHostToDevice, g_st));
+            CK(cudaMemcpyAsync(d_ent, ent.data(), (size_t) R * 4, cudaMemcpyHostToDevice, g_st));
+            PF::gather_rows16(xn16, d_src, x16, R, N, g_st);
+            for (const Piece& p : pcs) {
+                gemm.native(x16 + (size_t) (p.r0 * N), y.L.gu_type, p.w, yg + (size_t) (p.r0 * F), p.n, F, N);
+                gemm.native(x16 + (size_t) (p.r0 * N), y.L.gu_type, p.w + y.L.up_off, yu + (size_t) (p.r0 * F), p.n, F, N);
+            }
+            K::glm_swiglu_clamp(yg, yu, yg, R * F, y.lim_exp, g_st);
+            PF::to_f16(yg, h16, R * F, g_st);
+            for (const Piece& p : pcs)
+                gemm.native(h16 + (size_t) (p.r0 * F), y.L.d_type, p.w + y.L.down_off, yd + (size_t) (p.r0 * N), p.n, N, F);
+            K::glm_scatter_rows(yd, d_ent, R, N, parts, g_st);
+            n_gemm += R, n_gpu += R;
+            CK(cudaStreamSynchronize(g_st));   // src / ent are refilled next
+            pcs.clear(), src.clear(), ent.clear();
+        };
+        for (const auto& gr : grp) {
+            const auto& te = gr.second;
+            for (size_t i = 0; i < te.size();) {
+                if ((int64_t) src.size() == kGemmRows) flush();
+                const int64_t take = std::min<int64_t>((int64_t) te.size() - (int64_t) i, kGemmRows - (int64_t) src.size());
+                pcs.push_back({gr.first, (int64_t) src.size(), take});
+                for (int64_t q = 0; q < take; ++q, ++i) src.push_back(te[i].first), ent.push_back(te[i].second);
+            }
+        }
+        flush();
+    }
+
+    /// The products of a group: GEMMs when its experts average gemm_min rows or more, else native_expert_grouped.
+    void run_group(const Layer& y, const std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>>& grp) {
+        size_t rows = 0;
+        for (const auto& gr : grp) rows += gr.second.size();
+        if (gemm_ok && gemm_min > 0 && !grp.empty() && rows >= (size_t) gemm_min * grp.size()) run_gemm(y, grp);
+        else run_grouped(y, grp);
+    }
+
     /// A long step's experts (see Streamer): the cached ones in place, the rest streamed up in groups.
     void moe_streamed(const Layer& y, int64_t l, int T, const std::vector<int32_t>& ids) {
         const int64_t E = c.g.n_expert, Kx = c.g.n_expert_used;
@@ -685,7 +768,12 @@ struct Runner {
                 }
             }
         quantize_tokens(T);
-        run_grouped(y, res);
+        if (gemm_ok) PF::to_f16(xn, xn16, (int64_t) T * c.g.n_embd, g_st);
+        for (size_t r0 = 0; r0 < res.size(); r0 += (size_t) streamer.G) {   // in groups, as the streamed ones
+            std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> grp(
+                res.begin() + (std::ptrdiff_t) r0, res.begin() + (std::ptrdiff_t) std::min(res.size(), r0 + (size_t) streamer.G));
+            run_group(y, grp);
+        }
         Streamer& S = streamer;
         for (size_t g0 = 0, i = 0; g0 < str.size(); g0 += (size_t) S.G, ++i) {
             const int b = (int) (i & 1), n = (int) std::min(str.size() - g0, (size_t) S.G);
@@ -707,7 +795,7 @@ struct Runner {
             CK(cudaStreamWaitEvent(g_st, S.dma[b], 0));
             std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> grp;
             for (int q = 0; q < n; ++q) grp.push_back({S.dev[b] + (size_t) q * S.slot, str[g0 + (size_t) q].second});
-            run_grouped(y, grp);
+            run_group(y, grp);
             CK(cudaEventRecord(S.comp[b], g_st));
             S.experts += n, S.bytes += (double) n * (2 * y.egsz + y.edsz);
         }
@@ -1054,7 +1142,7 @@ int main(int argc, char** argv) {
     int n_gen = 64;
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
-    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8;
+    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8, gemm_min = 8;
     bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
@@ -1081,6 +1169,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-chunk") chunk = std::stoi(next());
         else if (a == "--stream-min") stream_min = std::stoi(next());
         else if (a == "--stream-threads") stream_threads = std::max(0, std::stoi(next()));
+        else if (a == "--gemm-min-rows") gemm_min = std::max(0, std::stoi(next()));
         else if (a == "--check-prompt") check_prompt = true;
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // the server adds options of its main engine (drafting, VRAM fit, ...): said and left out, never fatal
@@ -1091,7 +1180,7 @@ int main(int argc, char** argv) {
         } else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
                  "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 256] [--stream-min 64]\n"
-                 "  [--stream-threads 8] [--check-prompt]\n"
+                 "  [--stream-threads 8] [--gemm-min-rows 8] [--check-prompt]\n"
                  "  --serve (Strata's server protocol on stdin/stdout; --ctx / --max-context, --stop, --expert-profile*)");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
@@ -1106,7 +1195,7 @@ int main(int argc, char** argv) {
     // the prompt in steps of `chunk` tokens; --cpu-experts 0 evicts cache slots, which a step's later picks could
     // still need, so it keeps one token a step
     r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 2048)) : 1;
-    r.stream_min = stream_min, r.stream_threads = stream_threads;
+    r.stream_min = stream_min, r.stream_threads = stream_threads, r.gemm_min = gemm_min;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
         // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
@@ -1216,6 +1305,7 @@ int main(int argc, char** argv) {
                 "CPU experts (prompt included)\n",
                 (long long) r.n_gpu, (long long) r.cache.hits, (long long) r.cache.misses, (long long) r.n_cpu,
                 r.cache.copy_s, r.cpu_s);
+    if (r.n_gemm) std::printf("prompt GEMMs: %lld expert rows\n", (long long) r.n_gemm);
     if (r.streamer.experts)
         std::printf("prompt streaming: %lld experts (%.1f GB) streamed in %.1f s of MoE (%.1f GB/s); the copier threads %.1f s "
                     "(%.1f GB/s), waiting for the PCIe copies %.1f s\n", (long long) r.streamer.experts, r.streamer.bytes / 1e9,

@@ -22,4 +22,8 @@ void glm_router_sigmoid_topk(const float* logits, const float* bias, int32_t* id
 /// limit <= 1e-6 (llama.cpp's swiglu_clamp).  `out` may alias `gate`.
 void glm_swiglu_clamp(const float* gate, const float* up, float* out, int64_t n, float limit, void* stream);
 
+/// dst[idx[r], :] = src[r, :] for n rows of `width` floats (the prompt path's expert rows back to their (token, pick)
+/// places).  n at most 65535.
+void glm_scatter_rows(const float* src, const int32_t* idx, int64_t n, int64_t width, float* dst, void* stream);
+
 }  // namespace strata::kernels
