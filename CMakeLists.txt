@@ -661,6 +661,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(glm_mla_parity src/glm53/glm_mla_parity.cu)
     target_include_directories(glm_mla_parity PRIVATE include)
     target_link_libraries(glm_mla_parity PRIVATE strata_kernels CUDA::cudart)
+    # one real KDA (linear attention) layer decoding token by token on the GPU vs the CPU reference
+    add_executable(glm_kda_parity src/glm53/glm_kda_parity.cu)
+    target_include_directories(glm_kda_parity PRIVATE include)
+    target_link_libraries(glm_kda_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
   if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
