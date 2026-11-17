@@ -179,7 +179,7 @@ struct Streamer {
     bool quit = false;
 
     bool on() const { return host[0] != nullptr; }
-    void start(int groups_of, size_t slot_bytes, int threads) {
+    void start(int groups_of, size_t slot_bytes, int threads, const KC::ThreadAffinity& cpus) {
         G = groups_of, slot = slot_bytes;
         for (int b = 0; b < 2; ++b) {
             CK(cudaMallocHost(&host[b], (size_t) G * slot));
@@ -192,7 +192,13 @@ struct Streamer {
             CK(cudaEventRecord(dma[b], cs));
             CK(cudaEventRecord(comp[b], cs));
         }
-        for (int i = 0; i < threads; ++i) th.emplace_back([this] { loop(); });
+        // a thread starts with its creator's CPUs, and the creator is pinned to one core: each copier first takes back the
+        // CPUs the process had (8 copiers on one core gathered at 6.3 GB/s)
+        for (int i = 0; i < threads; ++i)
+            th.emplace_back([this, cpus] {
+                if (cpus.valid) KC::restore_thread_affinity(cpus);
+                loop();
+            });
     }
     void drain() {
         for (int i; (i = next.fetch_add(1)) < n_items;) job(i);
@@ -243,6 +249,7 @@ struct Runner {
     int stream_min = 0;         // --stream-min: a step of this many tokens or more streams its experts to the GPU (0: never)
     int stream_threads = 8;
     Streamer streamer;
+    KC::ThreadAffinity unpinned;   // this thread's CPUs before it was pinned: the copier threads run on all of them
     int64_t n_cpu = 0, n_gpu = 0;
     double cpu_s = 0;
     std::vector<double> heat;        // routing count of every (layer, expert), for --expert-profile-save
@@ -407,7 +414,7 @@ struct Runner {
         CK(cudaMalloc(&d_et, (size_t) (T * Kx) * 4));
 
         if (stream_min > 0 && chunk >= stream_min) {
-            streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads);
+            streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads, unpinned);
             std::printf("  prompt steps of %d+ tokens stream their experts: 2 x %d slots pinned and in VRAM (%.2f GB each side), "
                         "%d copier threads\n", stream_min, streamer.G, 2.0 * streamer.G * streamer.slot / 1e9, stream_threads);
         }
@@ -1085,7 +1092,7 @@ int main(int argc, char** argv) {
         // (generate.cpp's order too).
         r.pool = std::make_unique<KC::ExpertPool>(threads > 1 ? threads - 1 : 0);
         const int host = KC::planned_host_core();
-        if (host >= 0) KC::pin_current_thread(host);
+        if (host >= 0) r.unpinned = KC::pin_current_thread(host);
     }
     std::string err;
     if (!strata::core::glm5_geometry_from_gguf(gm.meta(), r.c.g, err)) die(err);
