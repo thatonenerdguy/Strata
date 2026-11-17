@@ -8,8 +8,8 @@
 //   dense: down(swiglu_clamp(gate x, up x))                     on native_mmvq / iq_mmvq and glm_swiglu_clamp
 //   MoE:   router logits (ffn_gate_inp) -> glm_router_sigmoid_topk (exp_probs_b, norm, scale), the 8 routed experts
 //          per token, the shared expert, and native_moe_combine_multi.  The routed experts run two ways: one GEMV per
-//          (token, expert) with the clamped SwiGLU (always), and native_expert_grouped, the engine's batched kernel
-//          (only when the layer has no SwiGLU clamp, since that kernel has the plain SwiGLU built in).
+//          (token, expert) with glm_swiglu_clamp, and native_expert_grouped, the engine's batched kernel, with the
+//          layer's clamp in NativeExpertLayout::swiglu_limit.
 // The reference dequantizes every weight it needs with the GPU's dequantizer (llama.cpp's block formats; iq_kernels)
 // and does the matrix products on the CPU in double, with glm53::sigmoid_route and swiglu_clamped (ffn_ref.hpp).
 // The GPU path quantizes activations to q8_1 like llama.cpp does, so the two differ by that rounding: the check is a
@@ -497,14 +497,12 @@ void check_moe(const Ctx& c, int64_t l, int T) {
     compare("MoE output", gout, rout, N, T, 5e-2);
 
     // 3b. the engine's grouped expert kernel (plain SwiGLU inside): only for a layer without the clamp
-    if (lim_e > 1e-6f) {
-        std::printf("  grouped experts: skipped, the layer clamps its SwiGLU at %g and native_expert_grouped has no "
-                    "clamp yet\n", lim_e);
-    } else if (!native_l || tg.type != tu.type) {
+    if (!native_l || tg.type != tu.type) {
         std::printf("  grouped experts: skipped, native_expert_grouped has no kernel for %s / %s at %lld x %lld\n",
                     tg.type_name(), td.type_name(), (long long) N, (long long) F);
     } else {
         K::NativeExpertLayout L = K::native_expert_layout((int) tg.type, (int) td.type, N, F);
+        L.swiglu_limit = lim_e;
         if (L.up_off != up_off || L.down_off != down_off || L.bytes != blob)
             die("native_expert_layout's blob differs from the one built here");
         std::vector<unsigned long long> gp;

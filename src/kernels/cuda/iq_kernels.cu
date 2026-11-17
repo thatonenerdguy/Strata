@@ -2203,6 +2203,15 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
     h[i] = (g / (1.0f + __expf(-g))) * up[i];
 }
 
+// GLM-5.3-Flash (NativeExpertLayout::swiglu_limit): llama.cpp's swiglu_clamp, silu(min(gate, limit)) * clamp(up, +-limit)
+__global__ void swiglu_clamp_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                            float* __restrict__ h, long long n, float limit) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = fminf(gate[i], limit);
+    h[i] = (g / (1.0f + __expf(-g))) * fminf(fmaxf(up[i], -limit), limit);
+}
+
 template<int TD>
 __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                           const int32_t* __restrict__ grp_start,
@@ -6442,6 +6451,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+    const bool clamp = L.swiglu_limit > 1e-6f;   // GLM-5.3-Flash: separate gate/up, clamped SwiGLU and q8_1 launches only
 #if !STRATA_EXPERT_NIBBLE_BUILT
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE's slots: the switch is refused at start in a build without the kernels
         std::fprintf(stderr, "native_expert_grouped: 4-bit gate/up slots are not built into this engine\n");
@@ -6451,7 +6461,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // STRATA_EXPERT_NIBBLE (nib_layout): only the gate/up step below takes another kernel (launch_gu_nib, in place of
     // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    if (v2 && !clamp && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -6490,7 +6500,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
+    if (v2k && !clamp && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
@@ -6528,7 +6538,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = !clamp && !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
@@ -6546,9 +6556,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // 147-verify STRATA_GU_SWIGLU=1: gate/up + SwiGLU + q8_1 in one launch where the CUDA layout's 16-lane kernel would run
     bool gs_done = false;
 #if STRATA_EXP_LAYOUTS
-    const bool gs_layout = !fused_gu && em0 == 0;
+    const bool gs_layout = !clamp && !fused_gu && em0 == 0;
 #else
-    const bool gs_layout = true;
+    const bool gs_layout = !clamp;
 #endif
     if (gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
@@ -6630,8 +6640,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (sw_v1 || L.had_block > 0) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+    if (sw_v1 || L.had_block > 0 || clamp) {
+        if (clamp) swiglu_clamp_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
+        else swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
