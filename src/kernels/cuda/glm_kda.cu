@@ -138,8 +138,9 @@ __global__ void k_gates_tokens(const float* g1, const float* dt, const float* A,
 // and written once a step, not twice a token); the arithmetic of each token is k_delta's, in its order
 template <int HD>
 __global__ void k_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
-                               float* o, int H, int T) {
+                               float* o, int H, int T, int hd_rt) {
     __shared__ float sq[HD], sk[HD], se[HD];
+    const float scale = rsqrtf((float) hd_rt);   // at run time, as k_delta: a folded constant rounds differently
     const int h = (int) blockIdx.x, j = (int) threadIdx.x;
     float* Sh = S + (size_t) h * HD * HD;
     float col[HD];
@@ -168,7 +169,7 @@ __global__ void k_delta_tokens(float* S, const float* q, const float* k, const f
             col[i] = s;
             out += s * sq[i];
         }
-        o[at + j] = out * rsqrtf((float) HD);
+        o[at + j] = out * scale;
     }
 #pragma unroll
     for (int i = 0; i < HD; ++i) Sh[(size_t) i * HD + j] = col[i];
@@ -228,8 +229,8 @@ bool glm_kda_delta_tokens_supported(int hd) { return hd == 64 || hd == 128; }
 
 void glm_kda_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
                           float* o, int H, int hd, int T, void* stream) {
-    if (hd == 128) k_delta_tokens<128><<<(unsigned) H, 128, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T);
-    else if (hd == 64) k_delta_tokens<64><<<(unsigned) H, 64, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T);
+    if (hd == 128) k_delta_tokens<128><<<(unsigned) H, 128, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd);
+    else if (hd == 64) k_delta_tokens<64><<<(unsigned) H, 64, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd);
     else throw std::invalid_argument("glm_kda_delta_tokens: hd");
     check("glm_kda_delta_tokens");
 }

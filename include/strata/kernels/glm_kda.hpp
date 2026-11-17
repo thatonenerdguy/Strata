@@ -25,7 +25,7 @@ void glm_kda_gates(const float* g1, const float* dt_bias, const float* A, float 
 void glm_kda_delta_step(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
                         float* o, int H, int hd, void* stream);
 
-/// The prompt path: T tokens at once, in order, with the per-token calls' arithmetic (the same bits as T calls).  p / out /
+/// The prompt path: T tokens at once, in order, with the per-token calls' arithmetic (conv and gates: the same bits as T calls; the delta rule: within FP32 rounding).  p / out /
 /// g1 / g / q / k / v / o hold T rows of D = H * hd, beta T rows of H.  glm_kda_conv_tokens: C at most 9.
 /// glm_kda_delta_tokens keeps each head's state in registers for the T steps: hd 64 or 128 (glm_kda_delta_tokens_supported).
 void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream);

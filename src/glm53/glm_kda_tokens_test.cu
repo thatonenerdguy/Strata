@@ -1,6 +1,7 @@
 // src/glm53/glm_kda_tokens_test.cu - the prompt path's KDA kernels (glm_kda_conv_tokens, glm_kda_gates_tokens,
 // glm_kda_delta_tokens) against the per-token ones they replace, on made-up inputs of GLM-5.3-Flash's shape: T tokens
-// in one launch must give the outputs and the states of T launches, bit for bit.  Needs a CUDA GPU.
+// in one launch must give the outputs and the states of T launches: the conv and gates bit for bit, the delta rule within
+// FP32 rounding (1e-5 of the largest value).  Needs a CUDA GPU.
 //   glm_kda_tokens_test [--tokens T]
 #include "strata/kernels/glm_kda.hpp"
 
@@ -30,11 +31,15 @@ std::vector<float> down(const float* d, size_t n) {
     return h;
 }
 int fails = 0;
-void same(const char* what, const std::vector<float>& a, const std::vector<float>& b) {
-    const bool ok = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
-    double dmax = 0;
-    for (size_t i = 0; i < a.size() && i < b.size(); ++i) dmax = std::fmax(dmax, std::fabs((double) a[i] - b[i]));
-    std::printf("  %-28s %s (max |diff| %.3g)\n", what, ok ? "bit-identical" : "DIFFERENT", dmax);
+// `rel`: the largest difference allowed, relative to the largest |value| (0: bit for bit)
+void same(const char* what, const std::vector<float>& a, const std::vector<float>& b, double rel = 0) {
+    const bool bits = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+    double dmax = 0, vmax = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+        dmax = std::fmax(dmax, std::fabs((double) a[i] - b[i])), vmax = std::fmax(vmax, std::fabs((double) a[i]));
+    const bool ok = bits || (rel > 0 && std::isfinite(dmax) && dmax <= rel * vmax);
+    std::printf("  %-28s %s (max |diff| %.3g of max |value| %.3g)\n", what,
+                bits ? "bit-identical" : ok ? "within FP32 rounding" : "DIFFERENT", dmax, vmax);
     fails += !ok;
 }
 }  // namespace
@@ -48,11 +53,12 @@ int main(int argc, char** argv) {
     std::mt19937 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);
     auto rnd = [&](size_t n, float sd) { std::vector<float> v(n); for (auto& x : v) x = nd(rng) * sd; return v; };
+    auto neg = [](std::vector<float> v) { for (auto& x : v) x = -std::fabs(x); return v; };   // A < 0, as the model's -exp(A_log): a decay
     for (int hd : {128, 64}) {
         const int H = 8, D = H * hd, C = 4;
         std::printf("hd %d, %d heads, %d tokens\n", hd, H, T);
         const std::vector<float> p = rnd((size_t) T * D, 1.f), w = rnd((size_t) D * C, 0.5f), st0 = rnd((size_t) (C - 1) * D, 1.f);
-        const std::vector<float> g1 = rnd((size_t) T * D, 1.f), dt = rnd((size_t) D, 0.3f), A = rnd((size_t) H, 1.f),
+        const std::vector<float> g1 = rnd((size_t) T * D, 1.f), dt = rnd((size_t) D, 0.3f), A = neg(rnd((size_t) H, 1.f)),
                                  bl = rnd((size_t) T * H, 1.f), S0 = rnd((size_t) H * hd * hd, 0.1f);
         std::vector<float> q = rnd((size_t) T * D, 0.1f), k = rnd((size_t) T * D, 0.1f), v = rnd((size_t) T * D, 1.f);
         float *dp = up(p), *dw = up(w), *dg1 = up(g1), *ddt = up(dt), *dA = up(A), *dq = up(q), *dk = up(k), *dv = up(v);
@@ -75,8 +81,9 @@ int main(int argc, char** argv) {
                 K::glm_kda_delta_step(Sa, dq + (size_t) t * D, dk + (size_t) t * D, dv + (size_t) t * D, ga + (size_t) t * D,
                                       ba + (size_t) t * H, oa + (size_t) t * D, H, hd, nullptr);
             K::glm_kda_delta_tokens(Sb, dq, dk, dv, ga, ba, ob, H, hd, T, nullptr);
-            same("delta outputs", down(oa, (size_t) T * D), down(ob, (size_t) T * D));
-            same("delta state", down(Sa, (size_t) H * hd * hd), down(Sb, (size_t) H * hd * hd));
+            // the compiler may schedule the register loop's FMAs apart from the global-memory one: FP32 rounding allowed
+            same("delta outputs", down(oa, (size_t) T * D), down(ob, (size_t) T * D), 1e-5);
+            same("delta state", down(Sa, (size_t) H * hd * hd), down(Sb, (size_t) H * hd * hd), 1e-5);
         }
     }
     CK(cudaDeviceSynchronize());

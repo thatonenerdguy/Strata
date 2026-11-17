@@ -509,7 +509,7 @@ struct Runner {
         const auto& g = c.g;
         const int H = (int) g.n_head, hd = (int) g.kda_head_dim, D = H * hd, C = (int) g.ssm_d_conv;
         float *q = t0, *k = t1, *v = t2, *p = t3;
-        const bool many = T > 1;   // the prompt path: one launch for the T tokens (the same bits as T)
+        const bool many = T > 1;   // the prompt path: one launch for the T tokens
         auto conv = [&](float* cs, const FMat& w, float* dst) {
             if (many) K::glm_kda_conv_tokens(p, cs, w.d, dst, D, C, T, g_st);
             else K::glm_kda_conv(p, cs, w.d, dst, D, C, g_st);
