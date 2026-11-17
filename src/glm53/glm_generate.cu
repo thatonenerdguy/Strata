@@ -526,6 +526,82 @@ struct Runner {
                     stop ? "; some skipped for " : "", stop ? stop : "");
     }
 
+    /// One block's weights and state, trunk or MTP (blk.<l>.): the mixer (KDA or MLA with its indexer), the FFN (dense or
+    /// MoE), and for a trunk block its hyper-connections.
+    void load_layer(Layer& y, int64_t l) {
+        const auto& g = c.g;
+        const int64_t N = g.n_embd;
+        const std::string b = "blk." + std::to_string(l) + ".";
+        y.attn = g.is_attention(l);
+        y.dense = g.is_dense(l);
+        y.idx_full = g.indexer_full(l);
+        if (!g.is_mtp(l)) {   // the MTP block is a plain pre-norm residual block: no hyper-connections
+            y.hc_attn = {up_f32(c, b + "hc_attn_fn.weight"), up_f32(c, b + "hc_attn_scale.weight"), up_f32(c, b + "hc_attn_base.weight")};
+            y.hc_ffn = {up_f32(c, b + "hc_ffn_fn.weight"), up_f32(c, b + "hc_ffn_scale.weight"), up_f32(c, b + "hc_ffn_base.weight")};
+        }
+        y.attn_norm = up_f32(c, b + "attn_norm.weight");
+        y.ffn_norm = up_f32(c, b + "ffn_norm.weight");
+        if (!y.attn) {
+            if (c.gm->find(b + "attn_qkv.weight")) die("layer " + std::to_string(l) + " fuses q/k/v (attn_qkv): not handled yet");
+            const int64_t D = g.kda_inner(), C = g.ssm_d_conv;
+            y.wq = up_mat(c, b + "attn_q.weight"), y.wk = up_mat(c, b + "attn_k.weight"), y.wv = up_mat(c, b + "attn_v.weight");
+            y.f_a = up_mat(c, b + "ssm_f_a.weight"), y.f_b = up_mat(c, b + "ssm_f_b.weight");
+            y.w_beta = up_mat(c, b + "ssm_beta.weight"), y.g_a = up_mat(c, b + "ssm_g_a.weight");
+            y.g_b = up_mat(c, b + "ssm_g_b.weight"), y.wo = up_mat(c, b + "attn_output.weight");
+            y.conv_q = up_f32(c, b + "ssm_conv1d_q.weight"), y.conv_k = up_f32(c, b + "ssm_conv1d_k.weight");
+            y.conv_v = up_f32(c, b + "ssm_conv1d_v.weight"), y.dt = up_f32(c, b + "ssm_dt.bias");
+            y.A = up_f32(c, b + "ssm_a"), y.o_norm = up_f32(c, b + "ssm_norm.weight");
+            y.cs_q = dalloc((size_t) ((C - 1) * D)), y.cs_k = dalloc((size_t) ((C - 1) * D)), y.cs_v = dalloc((size_t) ((C - 1) * D));
+            y.S = dalloc((size_t) (g.n_head * g.kda_head_dim * g.kda_head_dim));
+            g_vram += (size_t) (3 * (C - 1) * D + g.n_head * g.kda_head_dim * g.kda_head_dim) * 4;
+        } else {
+            y.q_a = up_mat(c, b + "attn_q_a.weight"), y.q_b = up_mat(c, b + "attn_q_b.weight");
+            y.kv_a = up_mat(c, b + "attn_kv_a_mqa.weight"), y.wo = up_mat(c, b + "attn_output.weight");
+            y.q_a_norm = up_f32(c, b + "attn_q_a_norm.weight"), y.kv_a_norm = up_f32(c, b + "attn_kv_a_norm.weight");
+            y.k_b = up_f32(c, b + "attn_k_b.weight"), y.v_b = up_f32(c, b + "attn_v_b.weight");
+            y.lat = dalloc((size_t) (ctx_max * g.kv_lora));
+            g_vram += (size_t) (ctx_max * g.kv_lora) * 4;
+            if (y.idx_full) {
+                const int64_t IK = g.idx_key_dim;
+                y.ix_q = up_mat(c, b + "indexer.attn_q_b.weight"), y.ix_k = up_mat(c, b + "indexer.attn_k.weight");
+                y.ix_g = up_mat(c, b + "indexer_compressor_gate.weight"), y.ix_p = up_mat(c, b + "indexer.proj.weight");
+                y.ix_kn = up_f32(c, b + "indexer.k_norm.weight"), y.ix_kb = f32_opt(c, b + "indexer.k_norm.bias");
+                y.ix_ape = up_f32(c, b + "indexer_compressor_ape.weight");
+                y.ikey = dalloc((size_t) (ctx_max * IK)), y.igate = dalloc((size_t) (ctx_max * IK));
+                y.pooled = dalloc((size_t) ((ctx_max / g.idx_kpool + 1) * IK));
+                g_vram += (size_t) (3 * ctx_max * IK) * 4;
+            }
+        }
+        if (y.dense) {
+            y.ffn_gate = up_mat(c, b + "ffn_gate.weight"), y.ffn_up = up_mat(c, b + "ffn_up.weight");
+            y.ffn_down = up_mat(c, b + "ffn_down.weight");
+        } else {
+            y.router = up_mat(c, b + "ffn_gate_inp.weight"), y.probs_b = up_f32(c, b + "exp_probs_b.bias");
+            y.sh_gate = up_mat(c, b + "ffn_gate_shexp.weight"), y.sh_up = up_mat(c, b + "ffn_up_shexp.weight");
+            y.sh_down = up_mat(c, b + "ffn_down_shexp.weight");
+            const strata::TensorInfo& tg = tensor(c, b + "ffn_gate_exps.weight", &y.eg);
+            const strata::TensorInfo& tu = tensor(c, b + "ffn_up_exps.weight", &y.eu);
+            const strata::TensorInfo& td = tensor(c, b + "ffn_down_exps.weight", &y.ed);
+            if (tg.type != tu.type) die(b + "ffn_gate_exps and ffn_up_exps differ in type");
+            const int64_t F = (int64_t) tg.shape[1];
+            if (!K::native_expert_supported((int) tg.type, (int) td.type, N, F))
+                die(b + " experts " + tg.type_name() + " / " + td.type_name() + ": no grouped expert kernel");
+            y.L = K::native_expert_layout((int) tg.type, (int) td.type, N, F);
+            y.lim_exp = g.limit_exp(l), y.lim_sh = g.limit_shexp(l);
+            y.L.swiglu_limit = y.lim_exp;
+            y.egsz = (size_t) strata::tensor_payload_bytes(tg) / (size_t) g.n_expert;
+            y.edsz = (size_t) strata::tensor_payload_bytes(td) / (size_t) g.n_expert;
+            if (y.L.up_off != y.egsz || y.L.down_off != 2 * y.egsz || y.L.bytes != 2 * y.egsz + y.edsz)
+                die(b + " the expert blob layout does not match the tensors");
+            if (cpu_experts) {
+                std::string e2;
+                // pool_bounds false: the pool gives a layer wider than the compiled shape runtime-sized scratch
+                if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2, false)) die(b + " CPU experts: " + e2);
+                y.fmt.swiglu_limit = y.lim_exp;
+            }
+        }
+    }
+
     void load(double cache_gb) {
         const auto& g = c.g;
         const int64_t N = g.n_embd;
@@ -533,74 +609,7 @@ struct Runner {
         std::fflush(stdout);
         layers.resize((size_t) g.n_layers);
         for (int64_t l = 0; l < g.n_layers; ++l) {
-            Layer& y = layers[(size_t) l];
-            const std::string b = "blk." + std::to_string(l) + ".";
-            y.attn = g.is_attention(l);
-            y.dense = g.is_dense(l);
-            y.idx_full = g.indexer_full(l);
-            y.hc_attn = {up_f32(c, b + "hc_attn_fn.weight"), up_f32(c, b + "hc_attn_scale.weight"), up_f32(c, b + "hc_attn_base.weight")};
-            y.hc_ffn = {up_f32(c, b + "hc_ffn_fn.weight"), up_f32(c, b + "hc_ffn_scale.weight"), up_f32(c, b + "hc_ffn_base.weight")};
-            y.attn_norm = up_f32(c, b + "attn_norm.weight");
-            y.ffn_norm = up_f32(c, b + "ffn_norm.weight");
-            if (!y.attn) {
-                if (c.gm->find(b + "attn_qkv.weight")) die("layer " + std::to_string(l) + " fuses q/k/v (attn_qkv): not handled yet");
-                const int64_t D = g.kda_inner(), C = g.ssm_d_conv;
-                y.wq = up_mat(c, b + "attn_q.weight"), y.wk = up_mat(c, b + "attn_k.weight"), y.wv = up_mat(c, b + "attn_v.weight");
-                y.f_a = up_mat(c, b + "ssm_f_a.weight"), y.f_b = up_mat(c, b + "ssm_f_b.weight");
-                y.w_beta = up_mat(c, b + "ssm_beta.weight"), y.g_a = up_mat(c, b + "ssm_g_a.weight");
-                y.g_b = up_mat(c, b + "ssm_g_b.weight"), y.wo = up_mat(c, b + "attn_output.weight");
-                y.conv_q = up_f32(c, b + "ssm_conv1d_q.weight"), y.conv_k = up_f32(c, b + "ssm_conv1d_k.weight");
-                y.conv_v = up_f32(c, b + "ssm_conv1d_v.weight"), y.dt = up_f32(c, b + "ssm_dt.bias");
-                y.A = up_f32(c, b + "ssm_a"), y.o_norm = up_f32(c, b + "ssm_norm.weight");
-                y.cs_q = dalloc((size_t) ((C - 1) * D)), y.cs_k = dalloc((size_t) ((C - 1) * D)), y.cs_v = dalloc((size_t) ((C - 1) * D));
-                y.S = dalloc((size_t) (g.n_head * g.kda_head_dim * g.kda_head_dim));
-                g_vram += (size_t) (3 * (C - 1) * D + g.n_head * g.kda_head_dim * g.kda_head_dim) * 4;
-            } else {
-                y.q_a = up_mat(c, b + "attn_q_a.weight"), y.q_b = up_mat(c, b + "attn_q_b.weight");
-                y.kv_a = up_mat(c, b + "attn_kv_a_mqa.weight"), y.wo = up_mat(c, b + "attn_output.weight");
-                y.q_a_norm = up_f32(c, b + "attn_q_a_norm.weight"), y.kv_a_norm = up_f32(c, b + "attn_kv_a_norm.weight");
-                y.k_b = up_f32(c, b + "attn_k_b.weight"), y.v_b = up_f32(c, b + "attn_v_b.weight");
-                y.lat = dalloc((size_t) (ctx_max * g.kv_lora));
-                g_vram += (size_t) (ctx_max * g.kv_lora) * 4;
-                if (y.idx_full) {
-                    const int64_t IK = g.idx_key_dim;
-                    y.ix_q = up_mat(c, b + "indexer.attn_q_b.weight"), y.ix_k = up_mat(c, b + "indexer.attn_k.weight");
-                    y.ix_g = up_mat(c, b + "indexer_compressor_gate.weight"), y.ix_p = up_mat(c, b + "indexer.proj.weight");
-                    y.ix_kn = up_f32(c, b + "indexer.k_norm.weight"), y.ix_kb = f32_opt(c, b + "indexer.k_norm.bias");
-                    y.ix_ape = up_f32(c, b + "indexer_compressor_ape.weight");
-                    y.ikey = dalloc((size_t) (ctx_max * IK)), y.igate = dalloc((size_t) (ctx_max * IK));
-                    y.pooled = dalloc((size_t) ((ctx_max / g.idx_kpool + 1) * IK));
-                    g_vram += (size_t) (3 * ctx_max * IK) * 4;
-                }
-            }
-            if (y.dense) {
-                y.ffn_gate = up_mat(c, b + "ffn_gate.weight"), y.ffn_up = up_mat(c, b + "ffn_up.weight");
-                y.ffn_down = up_mat(c, b + "ffn_down.weight");
-            } else {
-                y.router = up_mat(c, b + "ffn_gate_inp.weight"), y.probs_b = up_f32(c, b + "exp_probs_b.bias");
-                y.sh_gate = up_mat(c, b + "ffn_gate_shexp.weight"), y.sh_up = up_mat(c, b + "ffn_up_shexp.weight");
-                y.sh_down = up_mat(c, b + "ffn_down_shexp.weight");
-                const strata::TensorInfo& tg = tensor(c, b + "ffn_gate_exps.weight", &y.eg);
-                const strata::TensorInfo& tu = tensor(c, b + "ffn_up_exps.weight", &y.eu);
-                const strata::TensorInfo& td = tensor(c, b + "ffn_down_exps.weight", &y.ed);
-                if (tg.type != tu.type) die(b + "ffn_gate_exps and ffn_up_exps differ in type");
-                const int64_t F = (int64_t) tg.shape[1];
-                if (!K::native_expert_supported((int) tg.type, (int) td.type, N, F))
-                    die(b + " experts " + tg.type_name() + " / " + td.type_name() + ": no grouped expert kernel");
-                y.L = K::native_expert_layout((int) tg.type, (int) td.type, N, F);
-                y.lim_exp = g.limit_exp(l), y.lim_sh = g.limit_shexp(l);
-                y.L.swiglu_limit = y.lim_exp;
-                y.egsz = (size_t) strata::tensor_payload_bytes(tg) / (size_t) g.n_expert;
-                y.edsz = (size_t) strata::tensor_payload_bytes(td) / (size_t) g.n_expert;
-                if (y.L.up_off != y.egsz || y.L.down_off != 2 * y.egsz || y.L.bytes != 2 * y.egsz + y.edsz)
-                    die(b + " the expert blob layout does not match the tensors");
-                if (cpu_experts) {
-                    std::string e2;
-                    // pool_bounds false: the pool gives a layer wider than the compiled shape runtime-sized scratch
-                    if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2, false)) die(b + " CPU experts: " + e2);
-                    y.fmt.swiglu_limit = y.lim_exp;
-                }
-            }
+            load_layer(layers[(size_t) l], l);
             if (l % 5 == 4 || l + 1 == g.n_layers) {
                 std::printf("  %lld / %lld layers, %.2f GB in VRAM\n", (long long) (l + 1), (long long) g.n_layers, g_vram / 1e9);
                 std::fflush(stdout);
