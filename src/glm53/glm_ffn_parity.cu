@@ -547,18 +547,20 @@ int main(int argc, char** argv) {
     std::string model;
     std::vector<int64_t> layers;
     int T = 4;
+    bool types = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layers.push_back(std::atoll(argv[++i]));
         else if (a == "--tokens" && i + 1 < argc) T = std::atoi(argv[++i]);
+        else if (a == "--types") types = true;
         else {
-            std::fprintf(stderr, "usage: glm_ffn_parity --model <GGUF shard> [--layer N ...] [--tokens 1..8]\n");
+            std::fprintf(stderr, "usage: glm_ffn_parity --model <GGUF shard> [--layer N ...] [--tokens 1..8] [--types]\n");
             return 2;
         }
     }
     if (model.empty() || T < 1 || T > 8) {
-        std::fprintf(stderr, "usage: glm_ffn_parity --model <GGUF shard> [--layer N ...] [--tokens 1..8]\n");
+        std::fprintf(stderr, "usage: glm_ffn_parity --model <GGUF shard> [--layer N ...] [--tokens 1..8] [--types]\n");
         return 2;
     }
     strata::GgufModel gm = strata::GgufModel::open(model);
@@ -567,6 +569,33 @@ int main(int argc, char** argv) {
     std::string err;
     if (!strata::core::glm5_geometry_from_gguf(gm.meta(), c.g, err)) die(err);
     if (layers.empty()) layers = {0, c.g.n_dense_lead};
+    if (types) {   // every layer's FFN types and whether the kernels here take them; no GPU work
+        int bad = 0;
+        std::map<std::string, int> pairs;
+        for (int64_t l = 0; l < c.g.n_layers_all(); ++l) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            auto ty = [&](const std::string& n) {
+                const strata::TensorInfo* t = gm.find(b + n);
+                return t ? (int) t->type : -1;
+            };
+            if (c.g.is_dense(l)) {
+                for (const char* n : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+                    if (!mv_supported((uint32_t) ty(n))) { std::printf("  layer %lld: %s has no GEMV kernel\n", (long long) l, n); ++bad; }
+                continue;
+            }
+            const int g = ty("ffn_gate_exps.weight"), u = ty("ffn_up_exps.weight"), d = ty("ffn_down_exps.weight");
+            const bool ok = g == u && K::native_expert_supported(g, d, c.g.n_embd, c.g.n_ff_exp);
+            pairs[std::string(strata::ggml_type_name((uint32_t) g)) + " / " + strata::ggml_type_name((uint32_t) d) +
+                  (ok ? "" : "  (NOT covered by native_expert_grouped)")]++;
+            if (!ok) ++bad;
+            for (const char* n : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", "ffn_gate_inp.weight"})
+                if (!mv_supported((uint32_t) ty(n))) { std::printf("  layer %lld: %s has no GEMV kernel\n", (long long) l, n); ++bad; }
+        }
+        std::printf("expert gate-up / down types over the MoE layers:\n");
+        for (const auto& p : pairs) std::printf("  %-60s %d layer(s)\n", p.first.c_str(), p.second);
+        std::printf(bad ? "glm_ffn_parity --types: %d gap(s)\n" : "glm_ffn_parity --types: every FFN tensor has a kernel\n", bad);
+        return bad ? 1 : 0;
+    }
     CK(cudaStreamCreate(&g_st));
     int dev = 0;
     cudaDeviceProp prop{};
