@@ -322,7 +322,12 @@ struct Runner {
                     die(b + " the expert blob layout does not match the tensors");
                 if (cpu_experts) {
                     std::string e2;
-                    if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2)) die(b + " CPU experts: " + e2);
+                    // native_fmt also refuses activations larger than the engine pool's fixed buffers (sized for the
+                    // compiled model); act_bytes and h_bytes are filled just before that check, and this tool sizes
+                    // its own buffers from them, so only a failure before them stops it.
+                    if (!KC::native_fmt((int) tg.type, (int) td.type, N, F, y.fmt, e2) &&
+                        (y.fmt.act_bytes == 0 || y.fmt.h_bytes == 0))
+                        die(b + " CPU experts: " + e2);
                     // gate and up rows as a "down" of n_embd inputs at offset 0 of their own tensor slice
                     y.f_gate = y.fmt;
                     y.f_gate.d_type = y.fmt.gu_type, y.f_gate.d_act = y.fmt.gu_act, y.f_gate.d_row = y.fmt.gu_row;
@@ -525,7 +530,7 @@ struct Runner {
             float* o = (up ? ut : gt)[(size_t) m].data();
             KC::native_down_rows(up ? y.f_up : y.f_gate, blob, &act, 1, &o, r0, r1);
         });
-        const size_t hb = KC::native_act_bytes_for(F);
+        const size_t hb = y.fmt.h_bytes;
         std::vector<uint8_t> hq((size_t) M * hb);
         for (int m = 0; m < M; ++m) {
             float* g = gt[(size_t) m].data();
@@ -590,7 +595,7 @@ struct Runner {
         dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared);
         if (!cpu_e.empty()) {   // the GPU works on the cached experts and the shared one meanwhile
             const auto t0c = std::chrono::steady_clock::now();
-            std::vector<uint8_t> act(KC::native_act_bytes_for(N));
+            std::vector<uint8_t> act(y.fmt.act_bytes);
             KC::native_quant_act(y.fmt, h_x, act.data());
             std::vector<float*> dst;
             for (int k : cpu_k) dst.push_back(h_parts + (size_t) k * N);
