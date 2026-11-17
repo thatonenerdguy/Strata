@@ -6,12 +6,14 @@
 //                [--expert-cache-gb G]
 //
 // What it is: correctness first, built from the kernels the parity tools checked against llama.cpp's math
-// (glm_ffn_parity, glm_mla_parity, glm_kda_parity, glm_router_parity).  Every token, prompt included, goes through the
-// decode path one at a time.  Every weight except the routed experts sits in VRAM; the experts stay in the mapped file
+// (glm_ffn_parity, glm_mla_parity, glm_kda_parity, glm_router_parity).  The prompt goes through in steps of
+// --prompt-chunk tokens (projections 8 columns a launch, experts grouped over the step's tokens, the recurrences and the
+// attention a token at a time inside the step); decoding is a step of one.  --check-prompt runs the prompt both ways
+// and compares the last logits.  Every weight except the routed experts sits in VRAM; the experts stay in the mapped file
 // (host RAM / page cache).  Of the 8 a layer picks, those in the VRAM cache of expert slots run there with
 // native_expert_grouped; the others run on the CPU at the same time (ggml-cpu's dot products, a worker per core;
-// --cpu-experts 0 copies them into the cache instead).  The cache fills with the first experts used and then stays.  The indexer's top-k choice is made on the host.  Not yet: batched prompt
-// processing, the MTP drafter, speed work, the chat template (the wrapper's job).
+// --cpu-experts 0 copies them into the cache instead).  The cache fills with the first experts used and then stays.  The indexer's top-k choice is made on the host.  Not yet:
+// the MTP drafter, speed work, the chat template (the wrapper's job).
 #include "strata/glm53/mhc_ref.hpp"
 #include "strata/kernels/glm_kda.hpp"
 #include "strata/kernels/glm_mhc.hpp"
@@ -155,8 +157,9 @@ struct Runner {
     std::unique_ptr<KC::ExpertPool> pool;   // Strata's CPU expert pool: one pinned worker per physical core
     std::vector<KC::NativeFmt> job_fmt;     // per job: the gate rows are the blob, up and down at their distance
     std::vector<KC::ExpertJobMulti> jobs;
-    float* h_x = nullptr;       // pinned: the layer's normed input on the host
-    float* h_parts = nullptr;   // pinned: the CPU experts' output rows
+    float* h_x = nullptr;       // pinned: the layer's normed inputs on the host [chunk][n_embd]
+    float* h_parts = nullptr;   // pinned: the CPU experts' output rows [chunk][k][n_embd]
+    int chunk = 1;              // tokens a step() takes at most (--prompt-chunk); every buffer below holds this many
     int64_t n_cpu = 0, n_gpu = 0;
     double cpu_s = 0;
     std::vector<double> heat;        // routing count of every (layer, expert), for --expert-profile-save
@@ -174,7 +177,7 @@ struct Runner {
     void* xq = nullptr;
     float *streams = nullptr, *streams2 = nullptr, *hcw = nullptr, *x = nullptr, *xn = nullptr, *out = nullptr,
           *t0 = nullptr, *t1 = nullptr, *t2 = nullptr, *t3 = nullptr, *t4 = nullptr, *t5 = nullptr, *t6 = nullptr,
-          *logits = nullptr, *score = nullptr, *scr = nullptr;
+          *t7 = nullptr, *logits = nullptr, *score = nullptr, *scr = nullptr;
     int32_t *dtok = nullptr, *dcells = nullptr, *dids = nullptr;
     float* dw = nullptr;
     void* escr = nullptr;
@@ -182,12 +185,18 @@ struct Runner {
     unsigned long long* d_gp = nullptr;
     int32_t *d_gs = nullptr, *d_ng = nullptr, *d_ed = nullptr, *d_et = nullptr;
     ExpertCache cache;
-    std::vector<int32_t> cells;       // the last full indexer's choice (shared-indexer layers reuse it)
+    std::vector<std::vector<int32_t>> cells;   // per token of the step: the last full indexer's choice (shared layers reuse it)
     int64_t pos = 0;
 
-    void proj(const DMat& w, const float* in, float* o) {
-        if (!is_float_type(w.type)) K::native_quantize_q8_1(in, xq, (int) w.n_in, 1, g_st);
-        mv(w, in, xq, o, 1);
+    /// o[t] = W in[t] for T tokens (rows of n_in in, of n_out out), 8 columns a launch: native_mmvq's multi-column
+    /// layout gives every column the bits of a single-column call, so a batch changes no value.
+    void proj(const DMat& w, const float* in, float* o, int T = 1) {
+        for (int c0 = 0; c0 < T; c0 += 8) {
+            const int nc = std::min(8, T - c0);
+            const float* x0 = in + (size_t) c0 * w.n_in;
+            if (!is_float_type(w.type)) K::native_quantize_q8_1(x0, xq, (int) w.n_in, nc, g_st);
+            mv(w, x0, xq, o + (size_t) c0 * w.n_out, nc);
+        }
     }
 
     void load(double cache_gb) {
@@ -290,28 +299,29 @@ struct Runner {
         // activations
         const int64_t big = std::max<int64_t>({N, g.kda_inner(), g.n_head * g.value_length_mla, g.n_ff, g.n_head * g.kv_lora,
                                                g.q_lora, g.idx_heads * g.idx_key_dim, g.n_ff_exp * g.n_expert_shared});
-        xq = dbytes(K::native_q8_1_bytes((int) ((big + 255) / 256 * 256), 1));
-        streams = dalloc((size_t) (4 * N)), streams2 = dalloc((size_t) (4 * N)), hcw = dalloc(24);
-        x = dalloc((size_t) N), xn = dalloc((size_t) N), out = dalloc((size_t) N);
-        for (float** p : {&t0, &t1, &t2, &t3, &t4, &t5, &t6}) *p = dalloc((size_t) big);
+        const int64_t T = chunk, Kx = g.n_expert_used;
+        // q8_1 activations: 8 columns of the widest projection input, or the whole step's tokens for the experts
+        xq = dbytes(std::max(K::native_q8_1_bytes((int) ((big + 255) / 256 * 256), 8), (size_t) T * (size_t) (N / 32) * 36));
+        streams = dalloc((size_t) (T * 4 * N)), streams2 = dalloc((size_t) (T * 4 * N)), hcw = dalloc((size_t) (T * 24));
+        x = dalloc((size_t) (T * N)), xn = dalloc((size_t) (T * N)), out = dalloc((size_t) (T * N));
+        for (float** p : {&t0, &t1, &t2, &t3, &t4, &t5, &t6, &t7}) *p = dalloc((size_t) (T * big));
         logits = dalloc((size_t) head.n_out);
         score = dalloc((size_t) (ctx_max / g.idx_kpool + 1));
         scr = (float*) dbytes((size_t) K::glm_mla_attend_scratch_bytes((int) g.n_head, ctx_max));
-        CK(cudaMalloc(&dtok, 4));
+        CK(cudaMalloc(&dtok, (size_t) T * 4));
         CK(cudaMalloc(&dcells, (size_t) ctx_max * 4));
-        CK(cudaMalloc(&dids, (size_t) g.n_expert_used * 4));
-        dw = dalloc((size_t) g.n_expert_used);
-        const int64_t Kx = g.n_expert_used;
+        CK(cudaMalloc(&dids, (size_t) (T * Kx) * 4));
+        dw = dalloc((size_t) (T * Kx));
         size_t maxF = 0, maxblob = 0;
         for (const Layer& y : layers)
             if (!y.dense) maxF = std::max(maxF, (size_t) y.L.n_ff), maxblob = std::max(maxblob, y.L.bytes);
-        escr = dbytes(K::native_expert_scratch_bytes(Kx, (int64_t) maxF));
-        parts = dalloc((size_t) (Kx * N));
-        CK(cudaMalloc(&d_gp, (size_t) Kx * 8));
-        CK(cudaMalloc(&d_gs, (size_t) (Kx + 1) * 4));
+        escr = dbytes(K::native_expert_scratch_bytes(T * Kx, (int64_t) maxF));
+        parts = dalloc((size_t) (T * Kx * N));
+        CK(cudaMalloc(&d_gp, (size_t) (T * Kx) * 8));
+        CK(cudaMalloc(&d_gs, (size_t) (T * Kx + 1) * 4));
         CK(cudaMalloc(&d_ng, 4));
-        CK(cudaMalloc(&d_ed, (size_t) Kx * 4));
-        CK(cudaMalloc(&d_et, (size_t) Kx * 4));
+        CK(cudaMalloc(&d_ed, (size_t) (T * Kx) * 4));
+        CK(cudaMalloc(&d_et, (size_t) (T * Kx) * 4));
 
         // the expert cache: what is asked, or what is free minus 1 GB
         size_t fr = 0, tot = 0;
@@ -323,8 +333,8 @@ struct Runner {
         if (cache.n < (int) Kx) die("not enough VRAM left for " + std::to_string(Kx) + " expert slots");
         cache.base = (uint8_t*) dbytes((size_t) cache.n * cache.slot);
         for (int i = cache.n - 1; i >= 0; --i) cache.free_slots.push_back(i);
-        CK(cudaMallocHost(&h_x, (size_t) N * 4));
-        CK(cudaMallocHost(&h_parts, (size_t) (Kx * N) * 4));
+        CK(cudaMallocHost(&h_x, (size_t) (T * N) * 4));
+        CK(cudaMallocHost(&h_parts, (size_t) (T * Kx * N) * 4));
         if (cpu_experts)
             std::printf("  CPU experts (the ones not in the cache): Strata's pool, %s\n", pool->placement_line().c_str());
         std::printf("  expert cache: %d slots of %.1f MB (%.2f GB); %zu experts per layer x %lld MoE layers in RAM\n",
@@ -332,179 +342,241 @@ struct Runner {
                     (long long) (g.n_layers - g.n_dense_lead));
     }
 
-    void embed(int32_t tok) {
+    void embed(const int32_t* toks, int T) {
         const int64_t N = c.g.n_embd;
         if (emb_dev) {
-            CK(cudaMemcpyAsync(dtok, &tok, 4, cudaMemcpyHostToDevice, g_st));
-            K::iq_embed_rows((int) emb_type, emb_dev, emb_row, dtok, 1, N, x, g_st);
+            CK(cudaMemcpyAsync(dtok, toks, (size_t) T * 4, cudaMemcpyHostToDevice, g_st));
+            K::iq_embed_rows((int) emb_type, emb_dev, emb_row, dtok, T, N, x, g_st);
+            CK(cudaStreamSynchronize(g_st));   // `toks` may change before the copy runs otherwise
         } else {
-            const std::vector<float> r = dequant(emb_type, emb_host + (size_t) tok * emb_row, N);
-            CK(cudaMemcpyAsync(x, r.data(), (size_t) N * 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaStreamSynchronize(g_st));
+            for (int t = 0; t < T; ++t) {
+                const std::vector<float> r = dequant(emb_type, emb_host + (size_t) toks[t] * emb_row, N);
+                CK(cudaMemcpyAsync(x + (size_t) t * N, r.data(), (size_t) N * 4, cudaMemcpyHostToDevice, g_st));
+                CK(cudaStreamSynchronize(g_st));
+            }
         }
+        // streams [T][4][N]: every stream starts as the embedding
         for (int h = 0; h < 4; ++h)
-            CK(cudaMemcpyAsync(streams + h * N, x, (size_t) N * 4, cudaMemcpyDeviceToDevice, g_st));
+            CK(cudaMemcpy2DAsync(streams + h * N, (size_t) (4 * N) * 4, x, (size_t) N * 4, (size_t) N * 4, (size_t) T,
+                                 cudaMemcpyDeviceToDevice, g_st));
     }
 
-    void hc_pre(const Hc& h) {
+    void hc_pre(const Hc& h, int T) {
         const auto& g = c.g;
         K::glm_hc_pre(streams, h.fn.d, h.scale.d, h.base.d, g.n_embd, (float) g.rms_eps, (int) g.hc_sinkhorn_iters,
-                      (float) g.hc_eps, x, hcw, 1, g_st);
+                      (float) g.hc_eps, x, hcw, T, g_st);
     }
-    void hc_post() {
-        K::glm_hc_post(out, streams, hcw, c.g.n_embd, streams2, 1, g_st);
+    void hc_post(int T) {
+        K::glm_hc_post(out, streams, hcw, c.g.n_embd, streams2, T, g_st);
         std::swap(streams, streams2);
     }
 
-    void kda(Layer& y) {
+    /// T tokens through a KDA layer: the projections batched, the conv and the delta rule a token at a time (they carry
+    /// the state), the per-head norms over all T x H heads at once.
+    void kda(Layer& y, int T) {
         const auto& g = c.g;
         const int H = (int) g.n_head, hd = (int) g.kda_head_dim, D = H * hd, C = (int) g.ssm_d_conv;
         float *q = t0, *k = t1, *v = t2, *p = t3;
-        proj(y.wq, xn, p);
-        K::glm_kda_conv(p, y.cs_q, y.conv_q.d, q, D, C, g_st);
-        proj(y.wk, xn, p);
-        K::glm_kda_conv(p, y.cs_k, y.conv_k.d, k, D, C, g_st);
-        proj(y.wv, xn, p);
-        K::glm_kda_conv(p, y.cs_v, y.conv_v.d, v, D, C, g_st);
-        K::glm_kda_l2_heads(q, H, hd, 1e-6f, g_st);
-        K::glm_kda_l2_heads(k, H, hd, 1e-6f, g_st);
-        float *fa = t4, *g1 = t5, *gg = t6;
-        proj(y.f_a, xn, fa);
-        proj(y.f_b, fa, g1);
-        float* beta = t4 + hd;   // after f_a's hd values
-        proj(y.w_beta, xn, beta);
-        K::glm_kda_gates(g1, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg, beta, H, hd, g_st);
+        proj(y.wq, xn, p, T);
+        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_q, y.conv_q.d, q + (size_t) t * D, D, C, g_st);
+        proj(y.wk, xn, p, T);
+        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_k, y.conv_k.d, k + (size_t) t * D, D, C, g_st);
+        proj(y.wv, xn, p, T);
+        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_v, y.conv_v.d, v + (size_t) t * D, D, C, g_st);
+        K::glm_kda_l2_heads(q, H * T, hd, 1e-6f, g_st);
+        K::glm_kda_l2_heads(k, H * T, hd, 1e-6f, g_st);
+        float *fa = t4, *g1 = t5, *gg = t6, *beta = t7;
+        proj(y.f_a, xn, fa, T);
+        proj(y.f_b, fa, g1, T);
+        proj(y.w_beta, xn, beta, T);
         float* o = t3;
-        K::glm_kda_delta_step(y.S, q, k, v, gg, beta, o, H, hd, g_st);
+        for (int t = 0; t < T; ++t) {
+            K::glm_kda_gates(g1 + (size_t) t * D, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg + (size_t) t * D,
+                             beta + (size_t) t * H, H, hd, g_st);
+            K::glm_kda_delta_step(y.S, q + (size_t) t * D, k + (size_t) t * D, v + (size_t) t * D, gg + (size_t) t * D,
+                                  beta + (size_t) t * H, o + (size_t) t * D, H, hd, g_st);
+        }
         float *ga = t4, *g2 = t5;
-        proj(y.g_a, xn, ga);
-        proj(y.g_b, ga, g2);
-        K::glm_kda_out_norm(o, y.o_norm.d, g2, H, hd, (float) g.rms_eps, g_st);
-        proj(y.wo, o, out);
+        proj(y.g_a, xn, ga, T);
+        proj(y.g_b, ga, g2, T);
+        K::glm_kda_out_norm(o, y.o_norm.d, g2, H * T, hd, (float) g.rms_eps, g_st);
+        proj(y.wo, o, out, T);
     }
 
-    void mla(Layer& y) {
+    /// T tokens (positions pos .. pos + T - 1) through an MLA layer: the projections, the latents and the indexer keys
+    /// batched; each token's pooling, choice of cells and attention in order, so token t sees exactly the cache it
+    /// would see alone.
+    void mla(Layer& y, int T) {
         const auto& g = c.g;
         const int H = (int) g.n_head, L = (int) g.kv_lora, KH = (int) g.key_length_mla, VH = (int) g.value_length_mla;
-        const int IH = (int) g.idx_heads, IK = (int) g.idx_key_dim, P = (int) g.idx_kpool;
+        const int IH = (int) g.idx_heads, IK = (int) g.idx_key_dim, P = (int) g.idx_kpool, QL = (int) g.q_lora;
         float *qr = t0, *q = t1, *q_abs = t2;
-        proj(y.q_a, xn, qr);
-        K::glm_rms_norm(qr, y.q_a_norm.d, qr, g.q_lora, (float) g.rms_eps, 1, g_st);
-        proj(y.q_b, qr, q);
-        K::glm_head_matvec(y.k_b.d, q, q_abs, H, L, KH, g_st);
-        float* lat_t = y.lat + (size_t) pos * L;
-        proj(y.kv_a, xn, lat_t);
-        K::glm_rms_norm(lat_t, y.kv_a_norm.d, lat_t, L, (float) g.rms_eps, 1, g_st);
+        proj(y.q_a, xn, qr, T);
+        K::glm_rms_norm(qr, y.q_a_norm.d, qr, QL, (float) g.rms_eps, T, g_st);
+        proj(y.q_b, qr, q, T);
+        for (int t = 0; t < T; ++t)
+            K::glm_head_matvec(y.k_b.d, q + (size_t) t * H * KH, q_abs + (size_t) t * H * L, H, L, KH, g_st);
+        float* lat0 = y.lat + (size_t) pos * L;
+        proj(y.kv_a, xn, lat0, T);
+        K::glm_rms_norm(lat0, y.kv_a_norm.d, lat0, L, (float) g.rms_eps, T, g_st);
         if (y.idx_full) {
-            float* key_t = y.ikey + (size_t) pos * IK;
-            proj(y.ix_k, xn, key_t);
-            K::glm_layer_norm(key_t, y.ix_kn.d, y.ix_kb.d, key_t, IK, (float) g.ln_eps, 1, g_st);
-            proj(y.ix_g, xn, y.igate + (size_t) pos * IK);
-            const int n_pool = (int) ((pos + 1) / P);
-            if ((pos + 1) % P == 0)
-                K::glm_kpool_pool(y.ikey + (size_t) (pos + 1 - P) * IK, y.igate + (size_t) (pos + 1 - P) * IK, y.ix_ape.d,
-                                  y.pooled + (size_t) (n_pool - 1) * IK, IK, P, g_st);
-            const int64_t n_top = std::min<int64_t>(n_pool, g.idx_top_k / P);
-            std::vector<int64_t> order((size_t) n_pool);
-            for (int i = 0; i < n_pool; ++i) order[(size_t) i] = i;
-            if (n_top < n_pool) {   // only past top_k does the choice need the scores
-                float *iq = t3, *iw = t4;
-                proj(y.ix_q, qr, iq);
-                proj(y.ix_p, xn, iw);
-                K::glm_kpool_scores(iq, y.pooled, iw, 1.0f / std::sqrt((float) (IK * IH)), n_pool, IH, IK, score, g_st);
-                std::vector<float> sc((size_t) n_pool);
-                CK(cudaMemcpyAsync(sc.data(), score, (size_t) n_pool * 4, cudaMemcpyDeviceToHost, g_st));
-                CK(cudaStreamSynchronize(g_st));
-                std::partial_sort(order.begin(), order.begin() + n_top, order.end(), [&](int64_t a, int64_t b) {
-                    return sc[(size_t) a] > sc[(size_t) b] || (sc[(size_t) a] == sc[(size_t) b] && a < b);
-                });
+            cells.assign((size_t) T, {});
+            float* key0 = y.ikey + (size_t) pos * IK;
+            proj(y.ix_k, xn, key0, T);
+            K::glm_layer_norm(key0, y.ix_kn.d, y.ix_kb.d, key0, IK, (float) g.ln_eps, T, g_st);
+            proj(y.ix_g, xn, y.igate + (size_t) pos * IK, T);
+            const int64_t top_pools = g.idx_top_k / P;
+            float *iq = t3, *iw = t4;
+            if ((pos + T) / P > top_pools) {   // some token of the step has more pools than top_k: it needs the scores
+                proj(y.ix_q, qr, iq, T);
+                proj(y.ix_p, xn, iw, T);
             }
-            cells.clear();
-            for (int64_t i = 0; i < n_top; ++i)
-                for (int r = 0; r < P; ++r) cells.push_back((int32_t) (order[(size_t) i] * P + r));
-            if (g.idx_select_tail)
-                for (int64_t qq = (int64_t) n_pool * P; qq <= pos; ++qq) cells.push_back((int32_t) qq);
-            CK(cudaMemcpyAsync(dcells, cells.data(), cells.size() * 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaStreamSynchronize(g_st));   // `cells` may change before the copy runs otherwise
+            for (int t = 0; t < T; ++t) {
+                const int64_t at = pos + t;
+                const int n_pool = (int) ((at + 1) / P);
+                if ((at + 1) % P == 0)
+                    K::glm_kpool_pool(y.ikey + (size_t) (at + 1 - P) * IK, y.igate + (size_t) (at + 1 - P) * IK, y.ix_ape.d,
+                                      y.pooled + (size_t) (n_pool - 1) * IK, IK, P, g_st);
+                const int64_t n_top = std::min<int64_t>(n_pool, top_pools);
+                std::vector<int64_t> order((size_t) n_pool);
+                for (int i = 0; i < n_pool; ++i) order[(size_t) i] = i;
+                if (n_top < n_pool) {   // only past top_k does the choice need the scores
+                    K::glm_kpool_scores(iq + (size_t) t * IH * IK, y.pooled, iw + (size_t) t * IH,
+                                        1.0f / std::sqrt((float) (IK * IH)), n_pool, IH, IK, score, g_st);
+                    std::vector<float> sc((size_t) n_pool);
+                    CK(cudaMemcpyAsync(sc.data(), score, (size_t) n_pool * 4, cudaMemcpyDeviceToHost, g_st));
+                    CK(cudaStreamSynchronize(g_st));
+                    std::partial_sort(order.begin(), order.begin() + n_top, order.end(), [&](int64_t a, int64_t b) {
+                        return sc[(size_t) a] > sc[(size_t) b] || (sc[(size_t) a] == sc[(size_t) b] && a < b);
+                    });
+                }
+                std::vector<int32_t>& ct = cells[(size_t) t];
+                for (int64_t i = 0; i < n_top; ++i)
+                    for (int r = 0; r < P; ++r) ct.push_back((int32_t) (order[(size_t) i] * P + r));
+                if (g.idx_select_tail)
+                    for (int64_t qq = (int64_t) n_pool * P; qq <= at; ++qq) ct.push_back((int32_t) qq);
+            }
         }
-        float* o_lat = t3;
-        K::glm_mla_attend(q_abs, y.lat, dcells, (int) cells.size(), 1.0f / std::sqrt((float) KH), H, L, scr, o_lat, g_st);
-        float* o = t4;
-        K::glm_head_matvec(y.v_b.d, o_lat, o, H, VH, L, g_st);
-        proj(y.wo, o, out);
+        if ((int) cells.size() != T) die("a shared-indexer layer before any full indexer layer");
+        float *o_lat = t5, *o = t6;
+        for (int t = 0; t < T; ++t) {
+            const std::vector<int32_t>& ct = cells[(size_t) t];
+            CK(cudaMemcpyAsync(dcells, ct.data(), ct.size() * 4, cudaMemcpyHostToDevice, g_st));
+            K::glm_mla_attend(q_abs + (size_t) t * H * L, y.lat, dcells, (int) ct.size(), 1.0f / std::sqrt((float) KH), H, L,
+                              scr, o_lat + (size_t) t * H * L, g_st);
+            CK(cudaStreamSynchronize(g_st));   // dcells is reused by the next token
+            K::glm_head_matvec(y.v_b.d, o_lat + (size_t) t * H * L, o + (size_t) t * H * VH, H, VH, L, g_st);
+        }
+        proj(y.wo, o, out, T);
     }
 
-    void dense_ffn(const DMat& wg, const DMat& wu, const DMat& wd, float limit, float* dst) {
+    void dense_ffn(const DMat& wg, const DMat& wu, const DMat& wd, float limit, float* dst, int T) {
         const int64_t F = wg.n_out;
-        K::native_quantize_q8_1(xn, xq, (int) wg.n_in, 1, g_st);
-        mv(wg, xn, xq, t0, 1);
-        mv(wu, xn, xq, t1, 1);
-        K::glm_swiglu_clamp(t0, t1, t0, F, limit, g_st);
-        proj(wd, t0, dst);
+        proj(wg, xn, t0, T);
+        proj(wu, xn, t1, T);
+        K::glm_swiglu_clamp(t0, t1, t0, F * T, limit, g_st);
+        proj(wd, t0, dst, T);
     }
 
     /// The CPU's experts through Strata's ExpertPool (run_split_multi_native: every expert's rows split across all the
-    /// pinned threads, gate/up, the clamped SwiGLU, the down rows).  The three expert tensors are read in place, as
-    /// the engine's 149-cold mode reads a GGUF: the gate rows are the job's blob, up and down at their distance.
-    void cpu_experts_run(const Layer& y, const std::vector<int>& es, const void* act, const std::vector<float*>& dst) {
-        const size_t M = es.size();
-        job_fmt.resize(M);
-        jobs.assign(M, KC::ExpertJobMulti{});
-        for (size_t m = 0; m < M; ++m) {
-            const uint8_t* g = y.eg + (size_t) es[m] * y.egsz;
+    /// pinned threads, gate/up, the clamped SwiGLU, the down rows; an expert's rows are read once for all the tokens
+    /// that picked it, up to MAXT a job).  The three expert tensors are read in place, as the engine's 149-cold mode
+    /// reads a GGUF: the gate rows are the job's blob, up and down at their distance.  `picks[e]`: (token, entry) pairs.
+    void cpu_experts_run(const Layer& y, const std::vector<std::pair<int, std::vector<std::pair<int, int>>>>& picks,
+                         const std::vector<uint8_t>& acts) {
+        const int64_t N = c.g.n_embd;
+        size_t n_jobs = 0;
+        for (const auto& pk : picks) n_jobs += (pk.second.size() + KC::MAXT - 1) / KC::MAXT;
+        job_fmt.resize(picks.size());
+        jobs.assign(n_jobs, KC::ExpertJobMulti{});
+        size_t j = 0;
+        for (size_t m = 0; m < picks.size(); ++m) {
+            const int e = picks[m].first;
+            const uint8_t* gp = y.eg + (size_t) e * y.egsz;
             KC::NativeFmt& f = job_fmt[m];
             f = y.fmt;
-            f.up_off = (size_t) ((uintptr_t) (y.eu + (size_t) es[m] * y.egsz) - (uintptr_t) g);   // modular, as 149-cold
-            f.down_off = (size_t) ((uintptr_t) (y.ed + (size_t) es[m] * y.edsz) - (uintptr_t) g);
-            KC::ExpertJobMulti& jb = jobs[m];
-            jb.blob = g;
-            jb.nt = 1;
-            jb.nact[0] = act;
-            jb.out[0] = dst[m];
-            jb.fmt = &f;
+            f.up_off = (size_t) ((uintptr_t) (y.eu + (size_t) e * y.egsz) - (uintptr_t) gp);   // modular, as 149-cold
+            f.down_off = (size_t) ((uintptr_t) (y.ed + (size_t) e * y.edsz) - (uintptr_t) gp);
+            const auto& tk = picks[m].second;
+            for (size_t i = 0; i < tk.size(); ++i) {
+                if (i % KC::MAXT == 0) {
+                    KC::ExpertJobMulti& jb = jobs[j++];
+                    jb.blob = gp;
+                    jb.nt = 0;
+                    jb.fmt = &f;
+                }
+                KC::ExpertJobMulti& jb = jobs[j - 1];
+                jb.nact[jb.nt] = acts.data() + (size_t) tk[i].first * y.fmt.act_bytes;
+                jb.out[jb.nt] = h_parts + (size_t) tk[i].second * N;
+                ++jb.nt;
+            }
         }
-        pool->run_split_multi_native(y.fmt, jobs.data(), (int) M);
+        pool->run_split_multi_native(y.fmt, jobs.data(), (int) n_jobs);
     }
 
-    void moe(Layer& y, int64_t l) {
+    void moe(Layer& y, int64_t l, int T) {
         const auto& g = c.g;
         const int64_t N = g.n_embd, E = g.n_expert, Kx = g.n_expert_used;
         float* lg = t2;
-        proj(y.router, xn, lg);
+        proj(y.router, xn, lg, T);
         K::glm_router_sigmoid_topk(lg, y.probs_b.d, dids, dw, (int) E, (int) Kx, g.expert_weights_norm,
-                                   (float) g.expert_weights_scale, 1, g_st);
-        std::vector<int32_t> ids((size_t) Kx);
-        CK(cudaMemcpyAsync(ids.data(), dids, (size_t) Kx * 4, cudaMemcpyDeviceToHost, g_st));
-        if (cpu_experts) CK(cudaMemcpyAsync(h_x, xn, (size_t) N * 4, cudaMemcpyDeviceToHost, g_st));
-        std::vector<float> wts(routing ? (size_t) Kx : 0);
-        if (routing) CK(cudaMemcpyAsync(wts.data(), dw, (size_t) Kx * 4, cudaMemcpyDeviceToHost, g_st));
+                                   (float) g.expert_weights_scale, T, g_st);
+        std::vector<int32_t> ids((size_t) (T * Kx));
+        CK(cudaMemcpyAsync(ids.data(), dids, ids.size() * 4, cudaMemcpyDeviceToHost, g_st));
+        if (cpu_experts) CK(cudaMemcpyAsync(h_x, xn, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, g_st));
+        std::vector<float> wts(routing ? (size_t) (T * Kx) : 0);
+        if (routing) CK(cudaMemcpyAsync(wts.data(), dw, wts.size() * 4, cudaMemcpyDeviceToHost, g_st));
         CK(cudaStreamSynchronize(g_st));
-        for (int64_t k = 0; k < Kx; ++k) heat[(size_t) (l * E + ids[(size_t) k])] += 1.0;
-        if (routing) {
-            const int32_t rec[2] = {(int32_t) l, (int32_t) Kx};
-            std::fwrite(rec, sizeof rec, 1, routing);
-            std::fwrite(ids.data(), sizeof(int32_t), (size_t) Kx, routing);
-            std::fwrite(wts.data(), sizeof(float), (size_t) Kx, routing);
-        }
-        // the picks in the cache (or that fill a free slot) run on the GPU, the rest on the CPU; entry k -> row k of parts
+        for (int32_t e : ids) heat[(size_t) (l * E + e)] += 1.0;
+        if (routing)
+            for (int t = 0; t < T; ++t) {
+                const int32_t rec[2] = {(int32_t) l, (int32_t) Kx};
+                std::fwrite(rec, sizeof rec, 1, routing);
+                std::fwrite(ids.data() + (size_t) t * Kx, sizeof(int32_t), (size_t) Kx, routing);
+                std::fwrite(wts.data() + (size_t) t * Kx, sizeof(float), (size_t) Kx, routing);
+            }
+        // entry t * Kx + k (token t's k-th pick) -> that row of parts.  The picks in the cache (or that fill a free slot)
+        // run on the GPU, grouped by expert; the rest on the CPU, one job per expert for all its tokens.
+        std::vector<std::pair<uint8_t*, std::vector<std::pair<int, int>>>> gpu;   // slot -> (token, entry)
+        std::vector<std::pair<int, std::vector<std::pair<int, int>>>> cpu;        // expert -> (token, entry)
+        std::unordered_map<int, size_t> gpu_at, cpu_at;
+        std::vector<char> cpu_tok((size_t) T, 0);
+        for (int t = 0; t < T; ++t)
+            for (int64_t k = 0; k < Kx; ++k) {
+                const int en = (int) (t * Kx + k), e = ids[(size_t) en];
+                auto gi = gpu_at.find(e);
+                if (gi != gpu_at.end()) {
+                    ++cache.hits;
+                    gpu[gi->second].second.push_back({t, en});
+                    continue;
+                }
+                auto ci = cpu_at.find(e);
+                if (ci != cpu_at.end()) {
+                    cpu[ci->second].second.push_back({t, en});
+                    cpu_tok[(size_t) t] = 1;
+                    continue;
+                }
+                uint8_t* slot = cache.find(l, e, E);
+                if (!slot && (!cpu_experts || cache.has_free())) slot = cache.get(y, l, e, E);
+                if (slot) {
+                    gpu_at[e] = gpu.size();
+                    gpu.push_back({slot, {{t, en}}});
+                } else {
+                    cpu_at[e] = cpu.size();
+                    cpu.push_back({e, {{t, en}}});
+                    cpu_tok[(size_t) t] = 1;
+                }
+            }
         std::vector<unsigned long long> gp;
         std::vector<int32_t> gs, ed, et;
-        std::vector<int> cpu_e, cpu_k;
-        for (int64_t k = 0; k < Kx; ++k) {
-            const int e = ids[(size_t) k];
-            uint8_t* slot = cache.find(l, e, E);
-            if (!slot && (!cpu_experts || cache.has_free())) slot = cache.get(y, l, e, E);
-            if (slot) {
-                gp.push_back((unsigned long long) slot);
-                gs.push_back((int32_t) ed.size());
-                ed.push_back((int32_t) k);
-                et.push_back(0);
-            } else {
-                cpu_e.push_back(e);
-                cpu_k.push_back((int) k);
-            }
+        for (const auto& gr : gpu) {
+            gp.push_back((unsigned long long) gr.first);
+            gs.push_back((int32_t) ed.size());
+            for (const auto& te : gr.second) et.push_back(te.first), ed.push_back(te.second);
         }
-        n_gpu += (int64_t) ed.size(), n_cpu += (int64_t) cpu_e.size();
+        int64_t on_cpu = 0;
+        for (const auto& cr : cpu) on_cpu += (int64_t) cr.second.size();
+        n_gpu += (int64_t) ed.size(), n_cpu += on_cpu;
         const int32_t ng = (int32_t) gp.size();
         if (ng > 0) {
             gs.push_back((int32_t) ed.size());
@@ -513,24 +585,26 @@ struct Runner {
             CK(cudaMemcpyAsync(d_ng, &ng, 4, cudaMemcpyHostToDevice, g_st));
             CK(cudaMemcpyAsync(d_ed, ed.data(), ed.size() * 4, cudaMemcpyHostToDevice, g_st));
             CK(cudaMemcpyAsync(d_et, et.data(), et.size() * 4, cudaMemcpyHostToDevice, g_st));
-            K::native_quantize_q8_1(xn, xq, (int) N, 1, g_st);
+            for (int c0 = 0; c0 < T; c0 += 8)   // token t's q8_1 at t * N / 32 blocks, as native_expert_grouped reads them
+                K::native_quantize_q8_1(xn + (size_t) c0 * N, (uint8_t*) xq + (size_t) c0 * (N / 32) * 36, (int) N,
+                                        std::min(8, T - c0), g_st);
             K::native_expert_grouped(y.L, d_gp, d_gs, d_ng, d_ed, d_et, ng, (int64_t) ed.size(), xq, escr, parts, g_st);
         }
         float* shared = t3;
-        dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared);
-        if (!cpu_e.empty()) {   // the GPU works on the cached experts and the shared one meanwhile
+        dense_ffn(y.sh_gate, y.sh_up, y.sh_down, y.lim_sh, shared, T);
+        if (!cpu.empty()) {   // the GPU works on the cached experts and the shared one meanwhile
             const auto t0c = std::chrono::steady_clock::now();
-            std::vector<uint8_t> act(y.fmt.act_bytes);
-            KC::native_quant_act(y.fmt, h_x, act.data());
-            std::vector<float*> dst;
-            for (int k : cpu_k) dst.push_back(h_parts + (size_t) k * N);
-            cpu_experts_run(y, cpu_e, act.data(), dst);
+            std::vector<uint8_t> acts((size_t) T * y.fmt.act_bytes);
+            for (int t = 0; t < T; ++t)
+                if (cpu_tok[(size_t) t]) KC::native_quant_act(y.fmt, h_x + (size_t) t * N, acts.data() + (size_t) t * y.fmt.act_bytes);
+            cpu_experts_run(y, cpu, acts);
             cpu_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count();
-            for (int k : cpu_k)
-                CK(cudaMemcpyAsync(parts + (size_t) k * N, h_parts + (size_t) k * N, (size_t) N * 4,
-                                   cudaMemcpyHostToDevice, g_st));
+            for (const auto& cr : cpu)
+                for (const auto& te : cr.second)
+                    CK(cudaMemcpyAsync(parts + (size_t) te.second * N, h_parts + (size_t) te.second * N, (size_t) N * 4,
+                                       cudaMemcpyHostToDevice, g_st));
         }
-        K::native_moe_combine_multi(parts, dw, shared, out, N, Kx, 1, g_st);
+        K::native_moe_combine_multi(parts, dw, shared, out, N, Kx, T, g_st);
         CK(cudaStreamSynchronize(g_st));   // the host arrays above must outlive their copies
     }
 
@@ -567,29 +641,53 @@ struct Runner {
         else std::printf("expert profile saved: %s (%zu pairs)\n", path.c_str(), ranked.size());
     }
 
-    /// One token through the trunk; with `want_logits`, the head's logits land in `logits`.
-    void step(int32_t tok, bool want_logits) {
+    /// T tokens (at most `chunk`) through the trunk, at positions pos .. pos + T - 1; with `want_logits`, the last
+    /// token's logits land in `logits`.  Decoding is T = 1.
+    void step(const int32_t* toks, int T, bool want_logits) {
         const auto& g = c.g;
-        embed(tok);
+        const int64_t N = g.n_embd;
+        if (T < 1 || T > chunk) die("step: bad token count");
+        embed(toks, T);
         for (int64_t l = 0; l < g.n_layers; ++l) {
             Layer& y = layers[(size_t) l];
-            hc_pre(y.hc_attn);
-            K::glm_rms_norm(x, y.attn_norm.d, xn, g.n_embd, (float) g.rms_eps, 1, g_st);
-            if (y.attn) mla(y);
-            else kda(y);
-            hc_post();
-            hc_pre(y.hc_ffn);
-            K::glm_rms_norm(x, y.ffn_norm.d, xn, g.n_embd, (float) g.rms_eps, 1, g_st);
-            if (y.dense) dense_ffn(y.ffn_gate, y.ffn_up, y.ffn_down, g.limit_shexp(l), out);
-            else moe(y, l);
-            hc_post();
+            hc_pre(y.hc_attn, T);
+            K::glm_rms_norm(x, y.attn_norm.d, xn, N, (float) g.rms_eps, T, g_st);
+            if (y.attn) mla(y, T);
+            else kda(y, T);
+            hc_post(T);
+            hc_pre(y.hc_ffn, T);
+            K::glm_rms_norm(x, y.ffn_norm.d, xn, N, (float) g.rms_eps, T, g_st);
+            if (y.dense) dense_ffn(y.ffn_gate, y.ffn_up, y.ffn_down, g.limit_shexp(l), out, T);
+            else moe(y, l, T);
+            hc_post(T);
         }
         if (want_logits) {
-            K::glm_hc_mean(streams, g.n_embd, x, 1, g_st);
-            K::glm_rms_norm(x, out_norm.d, xn, g.n_embd, (float) g.rms_eps, 1, g_st);
+            K::glm_hc_mean(streams + (size_t) (T - 1) * 4 * N, N, x, 1, g_st);
+            K::glm_rms_norm(x, out_norm.d, xn, N, (float) g.rms_eps, 1, g_st);
             proj(head, xn, logits);
         }
-        ++pos;
+        pos += T;
+    }
+    /// The whole prompt, `chunk` tokens a step; the last token's logits in `logits`.
+    void prompt(const std::vector<int32_t>& ids) {
+        for (size_t i = 0; i < ids.size(); i += (size_t) chunk) {
+            const int T = (int) std::min<size_t>((size_t) chunk, ids.size() - i);
+            step(ids.data() + i, T, i + (size_t) T == ids.size());
+        }
+    }
+    /// Back to position 0 with empty recurrent states (--check-prompt runs the prompt twice).  The caches past pos
+    /// are never read before they are written again.
+    void reset() {
+        const auto& g = c.g;
+        const int64_t D = g.kda_inner(), C = g.ssm_d_conv;
+        for (Layer& y : layers)
+            if (!y.attn) {
+                for (float* p : {y.cs_q, y.cs_k, y.cs_v}) CK(cudaMemsetAsync(p, 0, (size_t) ((C - 1) * D) * 4, g_st));
+                CK(cudaMemsetAsync(y.S, 0, (size_t) (g.n_head * g.kda_head_dim * g.kda_head_dim) * 4, g_st));
+            }
+        CK(cudaStreamSynchronize(g_st));
+        cells.clear();
+        pos = 0;
     }
 };
 
@@ -610,7 +708,8 @@ int main(int argc, char** argv) {
     int n_gen = 64;
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
-    int cpu_exp = 1, threads = 0;
+    int cpu_exp = 1, threads = 0, chunk = 32;
+    bool check_prompt = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -632,9 +731,11 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") profile_in = next();
         else if (a == "--expert-profile-save") profile_out = next();
         else if (a == "--dump-routing") dump_routing = next();
+        else if (a == "--prompt-chunk") chunk = std::stoi(next());
+        else if (a == "--check-prompt") check_prompt = true;
         else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
-                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE]");
+                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 32] [--check-prompt]");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
     if (model.empty() || prompt.empty()) die("needs --model and --ids");
@@ -645,6 +746,9 @@ int main(int argc, char** argv) {
     r.c.gm = &gm;
     r.ctx_max = ctx;
     r.cpu_experts = cpu_exp != 0;
+    // the prompt in steps of `chunk` tokens; --cpu-experts 0 evicts cache slots, which a step's later picks could
+    // still need, so it keeps one token a step
+    r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 256)) : 1;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
         // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
@@ -704,9 +808,35 @@ int main(int argc, char** argv) {
     };
 
     const auto tp = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < prompt.size(); ++i) r.step(prompt[i], i + 1 == prompt.size());
+    r.prompt(prompt);
     const double prompt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
-    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s)\n", prompt.size(), prompt_s, prompt.size() / prompt_s);
+    std::printf("prompt: %zu tokens in %.1f s (%.2f tok/s, %d a step)\n", prompt.size(), prompt_s, prompt.size() / prompt_s,
+                r.chunk);
+    if (check_prompt) {
+        // the same prompt again one token a step (the decode path): the batched step must give the same logits.  The
+        // multi-column projections, the grouped experts and the pool's clamped rows are per-token exact, so the
+        // expectation is bit-identical; any difference is printed with its size.
+        std::vector<float> a((size_t) V), b((size_t) V);
+        CK(cudaMemcpy(a.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+        r.reset();
+        const auto t1 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < prompt.size(); ++i) r.step(&prompt[i], 1, i + 1 == prompt.size());
+        const double one_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        CK(cudaMemcpy(b.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+        double dmax = 0, num = 0, den = 0;
+        int64_t same = 0, ia = 0, ib = 0;
+        for (int64_t i = 0; i < V; ++i) {
+            const double d = (double) a[(size_t) i] - b[(size_t) i];
+            dmax = std::max(dmax, std::fabs(d)), num += d * d, den += (double) b[(size_t) i] * b[(size_t) i];
+            same += std::memcmp(&a[(size_t) i], &b[(size_t) i], 4) == 0;
+            if (a[(size_t) i] > a[(size_t) ia]) ia = i;
+            if (b[(size_t) i] > b[(size_t) ib]) ib = i;
+        }
+        std::printf("check-prompt: one token a step took %.1f s (%.2f tok/s); last logits %s: %lld of %lld bit-identical, "
+                    "max |diff| %.3g, rel L2 %.3g, top token %lld vs %lld\n",
+                    one_s, prompt.size() / one_s, same == V ? "IDENTICAL" : "DIFFER", (long long) same, (long long) V, dmax,
+                    std::sqrt(num / std::max(den, 1e-30)), (long long) ia, (long long) ib);
+    }
     std::printf("BEGIN_IDS\n");
     std::fflush(stdout);
     const auto tg = std::chrono::steady_clock::now();
@@ -716,7 +846,7 @@ int main(int argc, char** argv) {
         std::printf("%d\n", t);
         std::fflush(stdout);
         if (std::find(stop.begin(), stop.end(), t) != stop.end()) { ++made; break; }
-        if (made + 1 < n_gen) r.step(t, true);
+        if (made + 1 < n_gen) r.step(&t, 1, true);
     }
     const double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
     std::printf("END_IDS\n");
