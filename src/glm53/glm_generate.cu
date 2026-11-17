@@ -167,7 +167,7 @@ struct Streamer {
     cudaStream_t cs = nullptr;
     cudaEvent_t dma[2] = {}, comp[2] = {};
     int64_t experts = 0;
-    double bytes = 0, secs = 0;
+    double bytes = 0, secs = 0, copy_s = 0, wait_s = 0;   // copy_s: the threads' gathers; wait_s: waiting for a buffer's DMA
     // copier threads: run(n, fn) calls fn(0..n-1) on them and on the caller
     std::vector<std::thread> th;
     std::mutex m;
@@ -659,7 +659,9 @@ struct Runner {
         Streamer& S = streamer;
         for (size_t g0 = 0, i = 0; g0 < str.size(); g0 += (size_t) S.G, ++i) {
             const int b = (int) (i & 1), n = (int) std::min(str.size() - g0, (size_t) S.G);
+            const auto w0 = std::chrono::steady_clock::now();
             CK(cudaEventSynchronize(S.dma[b]));          // the pinned buffer's last DMA is done
+            const auto w1 = std::chrono::steady_clock::now();
             S.run(n, [&](int q) {
                 const int e = str[g0 + (size_t) q].first;
                 uint8_t* d = S.host[b] + (size_t) q * S.slot;
@@ -667,6 +669,8 @@ struct Runner {
                 std::memcpy(d + y.L.up_off, y.eu + (size_t) e * y.egsz, y.egsz);
                 std::memcpy(d + y.L.down_off, y.ed + (size_t) e * y.edsz, y.edsz);
             });
+            S.wait_s += std::chrono::duration<double>(w1 - w0).count();
+            S.copy_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - w1).count();
             CK(cudaStreamWaitEvent(S.cs, S.comp[b], 0));   // the VRAM buffer's last group is multiplied
             CK(cudaMemcpyAsync(S.dev[b], S.host[b], (size_t) n * S.slot, cudaMemcpyHostToDevice, S.cs));
             CK(cudaEventRecord(S.dma[b], S.cs));
@@ -1071,7 +1075,7 @@ int main(int argc, char** argv) {
     r.cpu_experts = cpu_exp != 0;
     // the prompt in steps of `chunk` tokens; --cpu-experts 0 evicts cache slots, which a step's later picks could
     // still need, so it keeps one token a step
-    r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 256)) : 1;
+    r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 2048)) : 1;
     r.stream_min = stream_min, r.stream_threads = stream_threads;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
@@ -1183,8 +1187,10 @@ int main(int argc, char** argv) {
                 (long long) r.n_gpu, (long long) r.cache.hits, (long long) r.cache.misses, (long long) r.n_cpu,
                 r.cache.copy_s, r.cpu_s);
     if (r.streamer.experts)
-        std::printf("prompt streaming: %lld experts (%.1f GB) streamed in %.1f s of MoE (%.1f GB/s)\n", (long long) r.streamer.experts,
-                    r.streamer.bytes / 1e9, r.streamer.secs, r.streamer.bytes / 1e9 / std::max(r.streamer.secs, 1e-9));
+        std::printf("prompt streaming: %lld experts (%.1f GB) streamed in %.1f s of MoE (%.1f GB/s); the copier threads %.1f s "
+                    "(%.1f GB/s), waiting for the PCIe copies %.1f s\n", (long long) r.streamer.experts, r.streamer.bytes / 1e9,
+                    r.streamer.secs, r.streamer.bytes / 1e9 / std::max(r.streamer.secs, 1e-9), r.streamer.copy_s,
+                    r.streamer.bytes / 1e9 / std::max(r.streamer.copy_s, 1e-9), r.streamer.wait_s);
     if (r.routing) std::fclose(r.routing);
     if (!profile_out.empty()) r.save_profile(profile_out, prior);
     return 0;
