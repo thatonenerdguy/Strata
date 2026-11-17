@@ -162,14 +162,15 @@ struct ExpertCache {
 /// VRAM cache go up to the GPU in groups, as Strata's engine streams a prompt chunk's experts through its ring
 /// (src/prefill/prefill.cpp, step 3): copier threads gather a group's blobs from the mapped file into a pinned buffer
 /// while the GPU multiplies the group before; one DMA per group into a VRAM staging buffer; native_expert_grouped then
-/// runs the group as it runs the cached experts.  Two buffers each side, events between them.  A chunk's experts are
+/// runs the group as it runs the cached experts.  NB buffers each side, events between them.  A chunk's experts are
 /// read once from RAM whatever its length, where the CPU path's work grows with the tokens.
 struct Streamer {
     int G = 16;                       // experts a group
     size_t slot = 0;                  // bytes an expert takes (the cache's slot: gate | up | down at the layout's offsets)
-    uint8_t *host[2] = {}, *dev[2] = {};
+    static constexpr int NB = 4;      // buffers each side: the copiers fill one while the GPU copies and multiplies the others
+    uint8_t *host[NB] = {}, *dev[NB] = {};
     cudaStream_t cs = nullptr;
-    cudaEvent_t dma[2] = {}, comp[2] = {};
+    cudaEvent_t dma[NB] = {}, comp[NB] = {};
     int64_t experts = 0;
     double bytes = 0, secs = 0, copy_s = 0, wait_s = 0;   // copy_s: the threads' gathers; wait_s: waiting for a buffer's DMA
     // copier threads: run(n, fn) calls fn(0..n-1) on them and on the caller
@@ -185,14 +186,14 @@ struct Streamer {
     bool on() const { return host[0] != nullptr; }
     void start(int groups_of, size_t slot_bytes, int threads, const KC::ThreadAffinity& cpus) {
         G = groups_of, slot = slot_bytes;
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < NB; ++b) {
             CK(cudaMallocHost(&host[b], (size_t) G * slot));
             CK(cudaMalloc(&dev[b], (size_t) G * slot));
             CK(cudaEventCreateWithFlags(&dma[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&comp[b], cudaEventDisableTiming));
         }
         CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < NB; ++b) {
             CK(cudaEventRecord(dma[b], cs));
             CK(cudaEventRecord(comp[b], cs));
         }
@@ -255,7 +256,7 @@ struct Runner {
     Streamer streamer;
     // the prompt path's many-row experts as tensor-core GEMMs (Strata's prefill Gemm::native: the GGUF blocks dequantized
     // to FP16, cuBLAS), --gemm-min-rows: a group of experts averaging this many rows or more (0: never)
-    int gemm_min = 8;
+    int gemm_min = 0;   // off by default: on an RTX 3060, 45.3 tok/s without against 43.1 with (1887 tokens)
     PF::Gemm gemm;
     bool gemm_ok = false;
     static constexpr int64_t kGemmRows = 2048;   // rows a GEMM batch takes at most (its buffers' size)
@@ -438,8 +439,9 @@ struct Runner {
 
         if (stream_min > 0 && chunk >= stream_min) {
             streamer.start(16, (maxblob + 255) & ~(size_t) 255, stream_threads, unpinned);
-            std::printf("  prompt steps of %d+ tokens stream their experts: 2 x %d slots pinned and in VRAM (%.2f GB each side), "
-                        "%d copier threads\n", stream_min, streamer.G, 2.0 * streamer.G * streamer.slot / 1e9, stream_threads);
+            std::printf("  prompt steps of %d+ tokens stream their experts: %d x %d slots pinned and in VRAM (%.2f GB each side), "
+                        "%d copier threads\n", stream_min, Streamer::NB, streamer.G,
+                        (double) Streamer::NB * streamer.G * streamer.slot / 1e9, stream_threads);
         }
         if (chunk >= kGemmProjMin) {   // the projections always; the experts from gemm_min rows (0: never)
             const int64_t R = kGemmRows, F = (int64_t) maxF;
@@ -779,7 +781,7 @@ struct Runner {
         }
         Streamer& S = streamer;
         for (size_t g0 = 0, i = 0; g0 < str.size(); g0 += (size_t) S.G, ++i) {
-            const int b = (int) (i & 1), n = (int) std::min(str.size() - g0, (size_t) S.G);
+            const int b = (int) (i % (size_t) Streamer::NB), n = (int) std::min(str.size() - g0, (size_t) S.G);
             const auto w0 = std::chrono::steady_clock::now();
             CK(cudaEventSynchronize(S.dma[b]));          // the pinned buffer's last DMA is done
             const auto w1 = std::chrono::steady_clock::now();
@@ -1145,7 +1147,7 @@ int main(int argc, char** argv) {
     int n_gen = 64;
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
-    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8, gemm_min = 8;
+    int cpu_exp = 1, threads = 0, chunk = 256, stream_min = 64, stream_threads = 8, gemm_min = 0;
     bool check_prompt = false, serve_mode = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
@@ -1183,7 +1185,7 @@ int main(int argc, char** argv) {
         } else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
                  "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
                  "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE] [--prompt-chunk 256] [--stream-min 64]\n"
-                 "  [--stream-threads 8] [--gemm-min-rows 8] [--check-prompt]\n"
+                 "  [--stream-threads 8] [--gemm-min-rows 0] [--check-prompt]\n"
                  "  --serve (Strata's server protocol on stdin/stdout; --ctx / --max-context, --stop, --expert-profile*)");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
