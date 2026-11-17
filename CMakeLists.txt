@@ -647,6 +647,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(glm_router_parity src/kernels/glm_router_parity.cu)
     target_include_directories(glm_router_parity PRIVATE include)
     target_link_libraries(glm_router_parity PRIVATE strata_kernels CUDA::cudart)
+    # one real layer's FFN from the GGUF (dense or MoE) on the GPU vs a CPU reference over the dequantized weights
+    add_executable(glm_ffn_parity src/glm53/glm_ffn_parity.cu)
+    target_include_directories(glm_ffn_parity PRIVATE include)
+    target_link_libraries(glm_ffn_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
   if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
