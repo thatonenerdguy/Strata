@@ -75,6 +75,10 @@ struct Glm5Geometry {
     double expert_weights_scale = 1; ///< expert_weights_scale (optional; the config's 2.5)
     bool expert_weights_norm = false;///< expert_weights_norm (optional)
     int64_t expert_gating_func = 2;  ///< expert_gating_func (optional; llama.cpp: 1 softmax, 2 sigmoid, absent = sigmoid)
+    /// swiglu_clamp_exp / swiglu_clamp_shexp (optional, one value per layer; the converter writes them when the config has
+    /// `swiglu_limit`): the routed experts' clamp, and the clamp of every build_ffn SwiGLU, i.e. the shared expert AND the
+    /// dense lead layers.  Empty = no clamp (glm53::swiglu_clamped with limit 0).
+    std::vector<float> swiglu_limit_exp, swiglu_limit_shexp;
 
     int64_t n_layers_all() const { return n_layers + n_mtp_layers; }
     int64_t kda_inner() const { return n_head * kda_head_dim; }
@@ -82,6 +86,8 @@ struct Glm5Geometry {
     bool is_attention(int64_t l) const { return l >= n_layers || attention[(size_t) l]; }
     bool is_dense(int64_t l) const { return l < n_dense_lead; }
     bool is_mtp(int64_t l) const { return l >= n_layers; }
+    float limit_exp(int64_t l) const { return swiglu_limit_exp.empty() ? 0.0f : swiglu_limit_exp[(size_t) l]; }
+    float limit_shexp(int64_t l) const { return swiglu_limit_shexp.empty() ? 0.0f : swiglu_limit_shexp[(size_t) l]; }
     bool indexer_full(int64_t l) const { return l >= n_layers || idx_full.empty() || idx_full[(size_t) l]; }
     int64_t n_attention_layers() const {
         int64_t n = 0;
@@ -211,6 +217,23 @@ inline bool glm5_geometry_from_gguf(const strata::GgufFile& meta, Glm5Geometry& 
             return bad("attention.indexer.types has the wrong number of entries");
         for (int64_t l = 0; l < g.n_layers; ++l) g.idx_full.push_back(v->items[(size_t) l].u != 0);
     }
+
+    // the SwiGLU clamps: a scalar or one value per layer; shexp falls back to exp (llama.cpp)
+    auto limits = [&](const char* key, std::vector<float>& out) {
+        out.clear();
+        const strata::MetaValue* v = get(key);
+        if (!v) return true;
+        if (v->is_num()) {
+            out.assign(all, (float) v->num());
+            return true;
+        }
+        if (v->type != strata::MetaType::ARRAY || v->items.size() != all) return false;
+        for (const strata::MetaValue& e : v->items) out.push_back((float) e.num());
+        return true;
+    };
+    if (!limits("swiglu_clamp_exp", g.swiglu_limit_exp)) return bad("swiglu_clamp_exp has the wrong number of entries");
+    if (!limits("swiglu_clamp_shexp", g.swiglu_limit_shexp)) return bad("swiglu_clamp_shexp has the wrong number of entries");
+    if (!get("swiglu_clamp_shexp")) g.swiglu_limit_shexp = g.swiglu_limit_exp;
 
     if (g.n_embd <= 0 || g.n_head <= 0 || g.kda_head_dim <= 0 || g.ssm_d_conv <= 0 || g.q_lora <= 0 ||
         g.kv_lora <= 0 || g.key_length_mla <= 0 || g.value_length_mla <= 0 || g.idx_heads <= 0 || g.idx_key_dim <= 0 ||

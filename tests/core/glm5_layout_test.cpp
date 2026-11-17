@@ -227,6 +227,16 @@ int main(int argc, char** argv) {
         check(g.hc == 4 && g.hc_sinkhorn_iters == 20 && g.hc_mix_dim() == 24, "mHC: 4 streams, 20 Sinkhorn iterations");
         check(g.n_dense_lead == 3 && g.n_ff == 12288 && g.is_dense(2) && !g.is_dense(3),
               "FFN: layers 0-2 dense (12288), MoE from layer 3");
+        check(g.swiglu_limit_exp.empty() && g.limit_exp(5) == 0.0f && g.limit_shexp(0) == 0.0f,
+              "no swiglu_clamp keys: no clamp");
+        std::vector<Kv> kv = metadata(kGlm53, 8);
+        kv.push_back(fixture::f32("glm5-next.swiglu_clamp_exp", 7.0f));
+        const fs::path cl = d.path / "glm-clamp.gguf";
+        fixture::write(cl, kv, {});
+        C::Glm5Geometry gc;
+        check(C::glm5_geometry_from_gguf(strata::GgufFile(cl.string()), gc, err) && gc.limit_exp(10) == 7.0f &&
+                  gc.limit_shexp(0) == 7.0f,
+              "swiglu_clamp_exp 7: the experts' clamp, and the shared / dense one falls back to it");
         check(g.n_expert == 288 && g.n_expert_used == 8 && g.n_ff_exp == 2048 && g.n_expert_shared == 1 &&
                   g.expert_weights_scale == 2.5 && g.expert_gating_func == 2,
               "MoE: 288 experts top-8 (2048), 1 shared, sigmoid, scale 2.5");
