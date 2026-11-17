@@ -58,6 +58,9 @@ struct Glm5Geometry {
     int64_t idx_key_dim = 128;       ///< attention.indexer.key_length
     int64_t idx_top_k = 2048;        ///< attention.indexer.top_k
     int64_t idx_kpool = 4;           ///< attention.indexer.kpool
+    bool idx_select_tail = true;     ///< attention.indexer.kpool_select_tail (optional, llama.cpp's default true): a token
+                                     ///< also attends to the cells of its own unfinished pool
+    double ln_eps = 1e-5;            ///< attention.layer_norm_epsilon (optional): the indexer key's LayerNorm
     std::vector<bool> idx_full;      ///< per trunk layer: attention.indexer.types (optional, default all true)
 
     // mHC
@@ -153,6 +156,9 @@ inline bool glm5_geometry_from_gguf(const strata::GgufFile& meta, Glm5Geometry& 
     num("attention.indexer.key_length", g.idx_key_dim);
     num("attention.indexer.top_k", g.idx_top_k);
     num("attention.indexer.kpool", g.idx_kpool);
+    if (const strata::MetaValue* v = get("attention.indexer.kpool_select_tail"))
+        if (v->is_num()) g.idx_select_tail = v->u != 0;
+    real("attention.layer_norm_epsilon", g.ln_eps);
     num("hyper_connection.count", g.hc);
     num("hyper_connection.sinkhorn_iterations", g.hc_sinkhorn_iters);
     real("hyper_connection.epsilon", g.hc_eps);
