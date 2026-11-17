@@ -40,7 +40,7 @@ def main() -> int:
     ap.add_argument("--stream-min", type=int, default=-1, help="steps of this many tokens or more stream their experts to the GPU "
                     "(-1: the tool's default, 64; 0: never, the CPU takes them)")
     ap.add_argument("--stream-threads", type=int, default=0, help="copier threads for the streamed experts (0: the tool's default, 8)")
-    ap.add_argument("--pin-experts", type=int, default=-1, help="page-lock the expert tensors so streamed experts go up by "
+    ap.add_argument("--pin-experts", type=int, default=-1, help="copy the expert tensors into a pinned arena so streamed experts go up by "
                     "direct DMA (-1: the tool's default, 1: in the background; 2: before load returns; 0: off)")
     ap.add_argument("--pin-reserve-gb", type=float, default=-1, help="RAM to keep unpinned (-1: the tool's default, 16)")
     ap.add_argument("--gemm-min-rows", type=int, default=-1, help="prompt expert groups averaging this many rows or more run as "
