@@ -30,6 +30,8 @@ def main() -> int:
     ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--expert-cache-gb", type=float, default=0.0)
+    ap.add_argument("--cpu-experts", type=int, default=1, help="1: experts not in the VRAM cache run on the CPU")
+    ap.add_argument("--threads", type=int, default=0, help="CPU threads for those experts (0: the tool's default)")
     ap.add_argument("--bin", default=str(HERE.parent / "build" / "glm_generate"))
     ap.add_argument("--show-template", action="store_true")
     ap.add_argument("--ids-only", action="store_true", help="print the prompt's ids and stop")
@@ -58,6 +60,9 @@ def main() -> int:
            "--temp", str(a.temp), "--stop", ",".join(map(str, sorted(stop)))]
     if a.expert_cache_gb > 0:
         cmd += ["--expert-cache-gb", str(a.expert_cache_gb)]
+    cmd += ["--cpu-experts", str(a.cpu_experts)]
+    if a.threads > 0:
+        cmd += ["--threads", str(a.threads)]
     print("prompt: %d tokens" % len(ids), file=sys.stderr)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
     out, shown, inside = [], "", False

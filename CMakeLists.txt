@@ -668,7 +668,7 @@ if(STRATA_NATIVE_EXPERTS)
     # the first end-to-end GLM-5.3-Flash runner (token ids in and out; tools/glm53_generate.py wraps it)
     add_executable(glm_generate src/glm53/glm_generate.cu)
     target_include_directories(glm_generate PRIVATE include)
-    target_link_libraries(glm_generate PRIVATE strata_kernels CUDA::cudart)
+    target_link_libraries(glm_generate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
   endif()
   if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
