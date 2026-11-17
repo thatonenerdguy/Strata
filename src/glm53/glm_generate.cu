@@ -269,6 +269,7 @@ struct Runner {
           *t0 = nullptr, *t1 = nullptr, *t2 = nullptr, *t3 = nullptr, *t4 = nullptr, *t5 = nullptr, *t6 = nullptr,
           *t7 = nullptr, *logits = nullptr, *score = nullptr, *scr = nullptr;
     int32_t *dtok = nullptr, *dcells = nullptr, *dids = nullptr;
+    size_t dcells_cap = 0;
     float* dw = nullptr;
     void* escr = nullptr;
     float* parts = nullptr;
@@ -399,7 +400,8 @@ struct Runner {
         score = dalloc((size_t) (ctx_max / g.idx_kpool + 1));
         scr = (float*) dbytes((size_t) K::glm_mla_attend_scratch_bytes((int) g.n_head, ctx_max));
         CK(cudaMalloc(&dtok, (size_t) T * 4));
-        CK(cudaMalloc(&dcells, (size_t) ctx_max * 4));
+        dcells_cap = (size_t) ctx_max;
+        CK(cudaMalloc(&dcells, dcells_cap * 4));
         CK(cudaMalloc(&dids, (size_t) (T * Kx) * 4));
         dw = dalloc((size_t) (T * Kx));
         size_t maxF = 0, maxblob = 0;
@@ -472,12 +474,17 @@ struct Runner {
         const auto& g = c.g;
         const int H = (int) g.n_head, hd = (int) g.kda_head_dim, D = H * hd, C = (int) g.ssm_d_conv;
         float *q = t0, *k = t1, *v = t2, *p = t3;
+        const bool many = T > 1;   // the prompt path: one launch for the T tokens (the same bits as T)
+        auto conv = [&](float* cs, const FMat& w, float* dst) {
+            if (many) K::glm_kda_conv_tokens(p, cs, w.d, dst, D, C, T, g_st);
+            else K::glm_kda_conv(p, cs, w.d, dst, D, C, g_st);
+        };
         proj(y.wq, xn, p, T);
-        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_q, y.conv_q.d, q + (size_t) t * D, D, C, g_st);
+        conv(y.cs_q, y.conv_q, q);
         proj(y.wk, xn, p, T);
-        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_k, y.conv_k.d, k + (size_t) t * D, D, C, g_st);
+        conv(y.cs_k, y.conv_k, k);
         proj(y.wv, xn, p, T);
-        for (int t = 0; t < T; ++t) K::glm_kda_conv(p + (size_t) t * D, y.cs_v, y.conv_v.d, v + (size_t) t * D, D, C, g_st);
+        conv(y.cs_v, y.conv_v, v);
         K::glm_kda_l2_heads(q, H * T, hd, 1e-6f, g_st);
         K::glm_kda_l2_heads(k, H * T, hd, 1e-6f, g_st);
         float *fa = t4, *g1 = t5, *gg = t6, *beta = t7;
@@ -485,6 +492,10 @@ struct Runner {
         proj(y.f_b, fa, g1, T);
         proj(y.w_beta, xn, beta, T);
         float* o = t3;
+        if (many && K::glm_kda_delta_tokens_supported(hd)) {
+            K::glm_kda_gates_tokens(g1, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg, beta, H, hd, T, g_st);
+            K::glm_kda_delta_tokens(y.S, q, k, v, gg, beta, o, H, hd, T, g_st);
+        } else
         for (int t = 0; t < T; ++t) {
             K::glm_kda_gates(g1 + (size_t) t * D, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg + (size_t) t * D,
                              beta + (size_t) t * H, H, hd, g_st);
@@ -554,14 +565,26 @@ struct Runner {
         }
         if ((int) cells.size() != T) die("a shared-indexer layer before any full indexer layer");
         float *o_lat = t5, *o = t6;
+        // every token's cells in one upload, back to back, so the tokens' attention runs without a wait between them
+        std::vector<int32_t> all;
+        std::vector<size_t> at0((size_t) T + 1, 0);
         for (int t = 0; t < T; ++t) {
-            const std::vector<int32_t>& ct = cells[(size_t) t];
-            CK(cudaMemcpyAsync(dcells, ct.data(), ct.size() * 4, cudaMemcpyHostToDevice, g_st));
-            K::glm_mla_attend(q_abs + (size_t) t * H * L, y.lat, dcells, (int) ct.size(), 1.0f / std::sqrt((float) KH), H, L,
-                              scr, o_lat + (size_t) t * H * L, g_st);
-            CK(cudaStreamSynchronize(g_st));   // dcells is reused by the next token
+            all.insert(all.end(), cells[(size_t) t].begin(), cells[(size_t) t].end());
+            at0[(size_t) t + 1] = all.size();
+        }
+        if (all.size() > dcells_cap) {
+            CK(cudaStreamSynchronize(g_st));
+            CK(cudaFree(dcells));
+            dcells_cap = all.size() * 2;
+            CK(cudaMalloc(&dcells, dcells_cap * 4));
+        }
+        CK(cudaMemcpyAsync(dcells, all.data(), all.size() * 4, cudaMemcpyHostToDevice, g_st));
+        for (int t = 0; t < T; ++t) {
+            K::glm_mla_attend(q_abs + (size_t) t * H * L, y.lat, dcells + at0[(size_t) t], (int) (at0[(size_t) t + 1] - at0[(size_t) t]),
+                              1.0f / std::sqrt((float) KH), H, L, scr, o_lat + (size_t) t * H * L, g_st);
             K::glm_head_matvec(y.v_b.d, o_lat + (size_t) t * H * L, o + (size_t) t * H * VH, H, VH, L, g_st);
         }
+        CK(cudaStreamSynchronize(g_st));   // `all` must outlive its copy
         proj(y.wo, o, out, T);
     }
 

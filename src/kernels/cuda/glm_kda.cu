@@ -101,6 +101,79 @@ __global__ void k_out_norm(float* o, const float* w, const float* gate, int hd, 
     for (int i = (int) threadIdx.x; i < hd; i += (int) blockDim.x) oh[i] = oh[i] * inv * w[i] * sigm(gh[i]);
 }
 
+// k_conv over T tokens (rows of D), in order: the same arithmetic per token, the window kept in registers
+template <int CM>
+__global__ void k_conv_tokens(const float* p, float* st, const float* w, float* out, int D, int C, int T) {
+    const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= D) return;
+    const float* wc = w + (size_t) c * C;
+    float win[CM];   // the C - 1 past inputs, oldest first
+    for (int k = 0; k < C - 1; ++k) win[k] = st[(size_t) k * D + c];
+    for (int t = 0; t < T; ++t) {
+        float a = 0;
+        for (int k = 0; k < C - 1; ++k) a += win[k] * wc[k];
+        const float pc = p[(size_t) t * D + c];
+        a += pc * wc[C - 1];
+        out[(size_t) t * D + c] = a * sigm(a);
+        for (int k = 0; k + 1 < C - 1; ++k) win[k] = win[k + 1];
+        if (C > 1) win[C - 2] = pc;
+    }
+    for (int k = 0; k < C - 1; ++k) st[(size_t) k * D + c] = win[k];
+}
+
+// k_gates over T tokens: g1 / g [T][H * hd], beta [T][H]
+__global__ void k_gates_tokens(const float* g1, const float* dt, const float* A, float lb, bool bounded, float* g, float* beta,
+                               int H, int hd, int T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x, D = (int64_t) H * hd;
+    if (i < D * T) {
+        const int c = (int) (i % D);
+        const float x = g1[i] + dt[c], a = A[c / hd];
+        if (bounded) g[i] = lb * sigm(-(x * a));
+        else g[i] = (x > 20.0f ? x : log1pf(expf(x))) * a;
+    }
+    if (i < (int64_t) H * T) beta[i] = sigm(beta[i]);
+}
+
+// k_delta over T tokens: thread j keeps its column S[:][j] in registers from the first token to the last (the state is read
+// and written once a step, not twice a token); the arithmetic of each token is k_delta's, in its order
+template <int HD>
+__global__ void k_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
+                               float* o, int H, int T) {
+    __shared__ float sq[HD], sk[HD], se[HD];
+    const int h = (int) blockIdx.x, j = (int) threadIdx.x;
+    float* Sh = S + (size_t) h * HD * HD;
+    float col[HD];
+#pragma unroll
+    for (int i = 0; i < HD; ++i) col[i] = Sh[(size_t) i * HD + j];
+    const size_t D = (size_t) H * HD;
+    for (int t = 0; t < T; ++t) {
+        const size_t at = (size_t) t * D + (size_t) h * HD;
+        __syncthreads();                    // the last token's q / k / exp(g) are read by every thread
+        sq[j] = q[at + j];
+        sk[j] = k[at + j];
+        se[j] = expf(g[at + j]);
+        __syncthreads();
+        float tt = 0;
+#pragma unroll
+        for (int i = 0; i < HD; ++i) {
+            const float s = col[i] * se[i];
+            col[i] = s;
+            tt += s * sk[i];
+        }
+        const float delta = (v[at + j] - tt) * beta[(size_t) t * H + h];
+        float out = 0;
+#pragma unroll
+        for (int i = 0; i < HD; ++i) {
+            const float s = col[i] + sk[i] * delta;
+            col[i] = s;
+            out += s * sq[i];
+        }
+        o[at + j] = out * rsqrtf((float) HD);
+    }
+#pragma unroll
+    for (int i = 0; i < HD; ++i) Sh[(size_t) i * HD + j] = col[i];
+}
+
 int threads_for(int hd) { return hd >= 1024 ? 1024 : ((hd + 31) / 32) * 32; }
 
 void check(const char* what) {
@@ -135,6 +208,30 @@ void glm_kda_delta_step(float* S, const float* q, const float* k, const float* v
     k_delta<<<(unsigned) H, threads_for(hd), (size_t) 3 * hd * sizeof(float), (cudaStream_t) stream>>>(S, q, k, v, g, beta,
                                                                                                     o, hd);
     check("glm_kda_delta_step");
+}
+
+void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream) {
+    if (C < 1 || C > 9) throw std::invalid_argument("glm_kda_conv_tokens: C");
+    k_conv_tokens<8><<<(unsigned) ((D + 255) / 256), 256, 0, (cudaStream_t) stream>>>(p, state, w, out, D, C, T);
+    check("glm_kda_conv_tokens");
+}
+
+void glm_kda_gates_tokens(const float* g1, const float* dt_bias, const float* A, float lower_bound, float* g, float* beta,
+                          int H, int hd, int T, void* stream) {
+    const int64_t n = (int64_t) H * hd * T;
+    k_gates_tokens<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(g1, dt_bias, A, lower_bound,
+                                                                                   std::isfinite(lower_bound), g, beta, H, hd, T);
+    check("glm_kda_gates_tokens");
+}
+
+bool glm_kda_delta_tokens_supported(int hd) { return hd == 64 || hd == 128; }
+
+void glm_kda_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
+                          float* o, int H, int hd, int T, void* stream) {
+    if (hd == 128) k_delta_tokens<128><<<(unsigned) H, 128, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T);
+    else if (hd == 64) k_delta_tokens<64><<<(unsigned) H, 64, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T);
+    else throw std::invalid_argument("glm_kda_delta_tokens: hd");
+    check("glm_kda_delta_tokens");
 }
 
 void glm_kda_out_norm(float* o, const float* w, const float* gate, int H, int hd, float eps, void* stream) {
