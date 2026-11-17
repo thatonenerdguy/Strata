@@ -40,6 +40,8 @@ def main() -> int:
     ap.add_argument("--stream-min", type=int, default=-1, help="steps of this many tokens or more stream their experts to the GPU "
                     "(-1: the tool's default, 64; 0: never, the CPU takes them)")
     ap.add_argument("--stream-threads", type=int, default=0, help="copier threads for the streamed experts (0: the tool's default, 8)")
+    ap.add_argument("--gemm-min-rows", type=int, default=-1, help="prompt expert groups averaging this many rows or more run as "
+                    "FP16 GEMMs (-1: the tool's default, 8; 0: never)")
     ap.add_argument("--check-prompt", action="store_true", help="run the prompt batched and one at a time, compare the logits")
     ap.add_argument("--dump-routing", default="", help="write a routing trace for tools/make_profile.py --n-layer 45 --n-expert 288")
     ap.add_argument("--bin", default=str(HERE.parent / "build" / "glm_generate"))
@@ -80,6 +82,8 @@ def main() -> int:
         cmd += ["--prompt-chunk", str(a.prompt_chunk)]
     if a.stream_min >= 0:
         cmd += ["--stream-min", str(a.stream_min)]
+    if a.gemm_min_rows >= 0:
+        cmd += ["--gemm-min-rows", str(a.gemm_min_rows)]
     if a.stream_threads > 0:
         cmd += ["--stream-threads", str(a.stream_threads)]
     if a.check_prompt:

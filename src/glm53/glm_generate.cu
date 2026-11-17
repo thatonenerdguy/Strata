@@ -20,6 +20,7 @@
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_router.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/pinned_ring.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -261,7 +262,8 @@ struct Runner {
     uint16_t *xn16 = nullptr, *x16 = nullptr, *h16 = nullptr, *p16 = nullptr;
     static constexpr int kGemmProjMin = 32;      // a projection over this many tokens or more is a GEMM (with gemm_ok)
     float *yg = nullptr, *yu = nullptr, *yd = nullptr;
-    int32_t *d_src = nullptr, *d_ent = nullptr;
+    int32_t* d_src = nullptr;
+    strata::core::PinnedRing tables;
     int64_t n_gemm = 0;
     KC::ThreadAffinity unpinned;   // this thread's CPUs before it was pinned: the copier threads run on all of them
     int64_t n_cpu = 0, n_gpu = 0;
@@ -439,7 +441,7 @@ struct Runner {
             std::printf("  prompt steps of %d+ tokens stream their experts: 2 x %d slots pinned and in VRAM (%.2f GB each side), "
                         "%d copier threads\n", stream_min, streamer.G, 2.0 * streamer.G * streamer.slot / 1e9, stream_threads);
         }
-        if (gemm_min > 0 && chunk >= kGemmProjMin) {
+        if (chunk >= kGemmProjMin) {   // the projections always; the experts from gemm_min rows (0: never)
             const int64_t R = kGemmRows, F = (int64_t) maxF;
             std::string gerr;
             gemm_ok = gemm.init(g_st, (int64_t) 32 << 20, gerr);   // the engine's GEMM_SCRATCH: every projection in one piece
@@ -449,8 +451,7 @@ struct Runner {
                 xn16 = (uint16_t*) dbytes((size_t) (T * N) * 2), x16 = (uint16_t*) dbytes((size_t) (R * N) * 2);
                 h16 = (uint16_t*) dbytes((size_t) (R * F) * 2);
                 yg = dalloc((size_t) (R * F)), yu = dalloc((size_t) (R * F)), yd = dalloc((size_t) (R * N));
-                CK(cudaMalloc(&d_src, (size_t) R * 4));
-                CK(cudaMalloc(&d_ent, (size_t) R * 4));
+                CK(cudaMalloc(&d_src, (size_t) (2 * R) * 4));   // a batch's source rows, then its entries
                 std::printf("  prompt steps: projections over %d+ tokens and experts with %d+ rows each as FP16 tensor-core GEMMs "
                             "(Strata's prefill Gemm)\n", kGemmProjMin, gemm_min);
             }
@@ -709,8 +710,11 @@ struct Runner {
         auto flush = [&]() {
             const int64_t R = (int64_t) src.size();
             if (R == 0) return;
-            CK(cudaMemcpyAsync(d_src, src.data(), (size_t) R * 4, cudaMemcpyHostToDevice, g_st));
-            CK(cudaMemcpyAsync(d_ent, ent.data(), (size_t) R * 4, cudaMemcpyHostToDevice, g_st));
+            // the two tables in one upload through Strata's pinned ring (core/pinned_ring.hpp): the host goes on at once,
+            // and the buffers are refilled only after the copy that read them (no wait on the GPU here)
+            src.insert(src.end(), ent.begin(), ent.end());
+            CK(tables.h2d(d_src, src.data(), (size_t) (2 * R) * 4, g_st));
+            const int32_t* d_ent_r = d_src + R;
             PF::gather_rows16(xn16, d_src, x16, R, N, g_st);
             for (const Piece& p : pcs) {
                 gemm.native(x16 + (size_t) (p.r0 * N), y.L.gu_type, p.w, yg + (size_t) (p.r0 * F), p.n, F, N);
@@ -720,9 +724,8 @@ struct Runner {
             PF::to_f16(yg, h16, R * F, g_st);
             for (const Piece& p : pcs)
                 gemm.native(h16 + (size_t) (p.r0 * F), y.L.d_type, p.w + y.L.down_off, yd + (size_t) (p.r0 * N), p.n, N, F);
-            K::glm_scatter_rows(yd, d_ent, R, N, parts, g_st);
+            K::glm_scatter_rows(yd, d_ent_r, R, N, parts, g_st);
             n_gemm += R, n_gpu += R;
-            CK(cudaStreamSynchronize(g_st));   // src / ent are refilled next
             pcs.clear(), src.clear(), ent.clear();
         };
         for (const auto& gr : grp) {
