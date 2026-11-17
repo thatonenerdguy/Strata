@@ -82,7 +82,7 @@ def main() -> int:
         "cwd": str(ROOT),
         "tokenizer": str(out / "tokenizer"),
         "model_name": a.name,
-        "arch": "glm5",
+        "arch": "glm5-next",   # the GGUF architecture, as the server's family tables key it
         "log": str(out / "engine.log"),
         "mtp": False,
         "fit_max_tokens": True,
