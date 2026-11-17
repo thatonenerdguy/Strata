@@ -17,7 +17,9 @@
 #include "strata/kernels/glm_mhc.hpp"
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_router.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_moe.hpp"
 
 #include "gguf_dev.cuh"
@@ -150,8 +152,16 @@ struct ExpertCache {
 /// A fixed set of worker threads for the CPU experts: run(n, f) calls f(0..n-1) spread over the workers and the caller.
 class Workers {
 public:
-    explicit Workers(int n) {
-        for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
+    /// `n` threads besides the caller; with `cores` (Strata's physical_cores order), worker i is pinned to
+    /// cores[i + 1] and the caller should sit on cores[0] - one thread per physical core, as the engine's pool does.
+    explicit Workers(int n, const std::vector<int>& cores = {}) {
+        for (int i = 0; i < n; ++i) {
+            const int core = i + 1 < (int) cores.size() ? cores[(size_t) i + 1] : -1;
+            th_.emplace_back([this, core] {
+                if (core >= 0) KC::pin_current_thread(core);
+                loop();
+            });
+        }
     }
     ~Workers() {
         {
@@ -223,6 +233,8 @@ struct Runner {
     float* h_parts = nullptr;   // pinned: the CPU experts' output rows
     int64_t n_cpu = 0, n_gpu = 0;
     double cpu_s = 0;
+    std::vector<double> heat;        // routing count of every (layer, expert), for --expert-profile-save
+    std::FILE* routing = nullptr;    // --dump-routing: the engine's trace format (layer, k, ids, weights), one record a token
     int64_t ctx_max = 4096;
     std::vector<Layer> layers;
     // embedding / head
@@ -560,7 +572,16 @@ struct Runner {
         std::vector<int32_t> ids((size_t) Kx);
         CK(cudaMemcpyAsync(ids.data(), dids, (size_t) Kx * 4, cudaMemcpyDeviceToHost, g_st));
         if (cpu_experts) CK(cudaMemcpyAsync(h_x, xn, (size_t) N * 4, cudaMemcpyDeviceToHost, g_st));
+        std::vector<float> wts(routing ? (size_t) Kx : 0);
+        if (routing) CK(cudaMemcpyAsync(wts.data(), dw, (size_t) Kx * 4, cudaMemcpyDeviceToHost, g_st));
         CK(cudaStreamSynchronize(g_st));
+        for (int64_t k = 0; k < Kx; ++k) heat[(size_t) (l * E + ids[(size_t) k])] += 1.0;
+        if (routing) {
+            const int32_t rec[2] = {(int32_t) l, (int32_t) Kx};
+            std::fwrite(rec, sizeof rec, 1, routing);
+            std::fwrite(ids.data(), sizeof(int32_t), (size_t) Kx, routing);
+            std::fwrite(wts.data(), sizeof(float), (size_t) Kx, routing);
+        }
         // the picks in the cache (or that fill a free slot) run on the GPU, the rest on the CPU; entry k -> row k of parts
         std::vector<unsigned long long> gp;
         std::vector<int32_t> gs, ed, et;
@@ -609,6 +630,39 @@ struct Runner {
         CK(cudaStreamSynchronize(g_st));   // the host arrays above must outlive their copies
     }
 
+    /// --expert-profile: fill the VRAM cache in the profile's order (tools/make_profile.py's ranking, or what an
+    /// earlier run saved), skipping the dense layers; the cache then stays as filled.  Returns the experts placed.
+    int fill_from_profile(const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+        const int64_t E = c.g.n_expert;
+        int placed = 0;
+        for (const auto& pr : ranked) {
+            if (!cache.has_free()) break;
+            if (pr.first < 0 || pr.first >= c.g.n_layers || pr.second < 0 || pr.second >= E) continue;
+            const Layer& y = layers[(size_t) pr.first];
+            if (y.dense) continue;
+            cache.get(y, pr.first, pr.second, E);
+            ++placed;
+        }
+        CK(cudaStreamSynchronize(g_st));
+        cache.hits = cache.misses = 0;
+        return placed;
+    }
+    /// --expert-profile-save: the engine's #477 ranking, by this run's routing and then the prior.  The engine puts
+    /// the resident experts first because its adaptive tier has swapped the hot ones in by then; this cache never
+    /// swaps, so its residents are only the ones that came first, and they get no place of their own.
+    void save_profile(const std::string& path, const std::vector<std::pair<int32_t, int32_t>>& prior) {
+        const int64_t L = c.g.n_layers, E = c.g.n_expert;
+        const std::vector<uint8_t> resident((size_t) (L * E), 0);
+        std::vector<std::pair<int32_t, int32_t>> ranked = strata::core::rank_learned_profile(L, E, resident, heat, prior);
+        // the dense layers route nothing: leave their pairs out, so a start never spends a slot on them
+        ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
+                                    [&](const std::pair<int32_t, int32_t>& p) { return layers[(size_t) p.first].dense; }),
+                     ranked.end());
+        std::string err;
+        if (!strata::core::write_expert_profile(path, L, E, ranked, err)) std::fprintf(stderr, "glm_generate: %s\n", err.c_str());
+        else std::printf("expert profile saved: %s (%zu pairs)\n", path.c_str(), ranked.size());
+    }
+
     /// One token through the trunk; with `want_logits`, the head's logits land in `logits`.
     void step(int32_t tok, bool want_logits) {
         const auto& g = c.g;
@@ -653,6 +707,7 @@ int main(int argc, char** argv) {
     int64_t ctx = 4096;
     double temp = 0, cache_gb = 0;
     int cpu_exp = 1, threads = 0;
+    std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -670,8 +725,12 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-gb") cache_gb = std::stod(next());
         else if (a == "--cpu-experts") cpu_exp = std::stoi(next());
         else if (a == "--threads") threads = std::stoi(next());
+        else if (a == "--expert-profile") profile_in = next();
+        else if (a == "--expert-profile-save") profile_out = next();
+        else if (a == "--dump-routing") dump_routing = next();
         else die("unknown argument " + a + "\nusage: glm_generate --model <shard> --ids \"1,2,3\" [--n 64] [--ctx 4096] "
-                 "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]");
+                 "[--temp 0] [--seed 1] [--stop \"id,id\"] [--expert-cache-gb G] [--cpu-experts 1] [--threads N]\n"
+                 "  [--expert-profile P] [--expert-profile-save P] [--dump-routing TRACE]");
     }
     const std::vector<int32_t> prompt = parse_ids(ids_s), stop = parse_ids(stop_s);
     if (model.empty() || prompt.empty()) die("needs --model and --ids");
@@ -684,9 +743,14 @@ int main(int argc, char** argv) {
     r.cpu_experts = cpu_exp != 0;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
-        const int hw = (int) std::thread::hardware_concurrency();
-        const int n = threads > 0 ? threads : std::max(1, hw / 2);   // one per physical core, roughly
-        r.workers = std::make_unique<Workers>(n - 1);
+        // Strata's own topology: one logical processor per physical core (pool.hpp physical_cores), the main
+        // thread on the first and a pinned worker on each of the rest; --threads N takes the first N of them
+        // (more than there are physical cores: the extra threads run unpinned)
+        std::vector<int> cores = KC::physical_cores(false);
+        const int n = threads > 0 ? threads : std::max(1, (int) cores.size());
+        if ((int) cores.size() > n) cores.resize((size_t) n);
+        if (!cores.empty()) KC::pin_current_thread(cores[0]);
+        r.workers = std::make_unique<Workers>(n - 1, cores);
     }
     std::string err;
     if (!strata::core::glm5_geometry_from_gguf(gm.meta(), r.c.g, err)) die(err);
@@ -702,6 +766,16 @@ int main(int argc, char** argv) {
                 prop.totalGlobalMem / 1e9);
     const auto tl = std::chrono::steady_clock::now();
     r.load(cache_gb);
+    r.heat.assign((size_t) (r.c.g.n_layers * r.c.g.n_expert), 0.0);
+    std::vector<std::pair<int32_t, int32_t>> prior;
+    if (!profile_in.empty()) {
+        int64_t slots = 0;
+        if (!strata::core::read_expert_profile(profile_in, r.c.g.n_layers, r.c.g.n_expert, prior, slots, err))
+            die("--expert-profile: " + err);
+        const int placed = r.fill_from_profile(prior);
+        std::printf("  expert cache: %d experts placed from %s (%zu ranked)\n", placed, profile_in.c_str(), prior.size());
+    }
+    if (!dump_routing.empty() && !(r.routing = std::fopen(dump_routing.c_str(), "wb"))) die("cannot write " + dump_routing);
     std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
     std::fflush(stdout);
 
@@ -748,5 +822,7 @@ int main(int argc, char** argv) {
                 "CPU experts (prompt included)\n",
                 (long long) r.n_gpu, (long long) r.cache.hits, (long long) r.cache.misses, (long long) r.n_cpu,
                 r.cache.copy_s, r.cpu_s);
+    if (r.routing) std::fclose(r.routing);
+    if (!profile_out.empty()) r.save_profile(profile_out, prior);
     return 0;
 }

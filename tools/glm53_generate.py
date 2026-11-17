@@ -31,7 +31,12 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--expert-cache-gb", type=float, default=0.0)
     ap.add_argument("--cpu-experts", type=int, default=1, help="1: experts not in the VRAM cache run on the CPU")
-    ap.add_argument("--threads", type=int, default=0, help="CPU threads for those experts (0: the tool's default)")
+    ap.add_argument("--threads", type=int, default=0, help="CPU threads for those experts (0: one per physical core)")
+    ap.add_argument("--profile", default="",
+                    help="expert profile: which experts start in VRAM, loaded if it exists and updated after every run "
+                         "with what the run routed (default: strata-expert-profile.bin beside the model)")
+    ap.add_argument("--no-profile", action="store_true", help="neither load nor save a profile")
+    ap.add_argument("--dump-routing", default="", help="write a routing trace for tools/make_profile.py --n-layer 45 --n-expert 288")
     ap.add_argument("--bin", default=str(HERE.parent / "build" / "glm_generate"))
     ap.add_argument("--show-template", action="store_true")
     ap.add_argument("--ids-only", action="store_true", help="print the prompt's ids and stop")
@@ -61,6 +66,13 @@ def main() -> int:
     if a.expert_cache_gb > 0:
         cmd += ["--expert-cache-gb", str(a.expert_cache_gb)]
     cmd += ["--cpu-experts", str(a.cpu_experts)]
+    if not a.no_profile:
+        prof = pathlib.Path(a.profile) if a.profile else pathlib.Path(a.model).resolve().parent / "strata-expert-profile.bin"
+        if prof.exists():
+            cmd += ["--expert-profile", str(prof)]
+        cmd += ["--expert-profile-save", str(prof)]
+    if a.dump_routing:
+        cmd += ["--dump-routing", a.dump_routing]
     if a.threads > 0:
         cmd += ["--threads", str(a.threads)]
     print("prompt: %d tokens" % len(ids), file=sys.stderr)
