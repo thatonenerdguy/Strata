@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/prefill/equal_cut_rule.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -1241,45 +1242,47 @@ std::vector<int32_t> parse_ids(const std::string& s) {
     return v;
 }
 
-struct Sampling {
-    double temp = 0, top_p = 1, min_p = 0;
-    int top_k = 0;
+namespace KS = strata::kernels;
+
+/// The next token, by Strata's sampler chain on the device (kernels/sampler.hpp: penalties -> top_k -> top_p -> min_p ->
+/// temperature -> pick, llama.cpp's order, Philox on (seed, counter)): the logits stay on the GPU and one id comes back.
+/// The penalty history is the request's (as the main engine's: the reply, from the last prompt token, unless
+/// STRATA_PENALTY_PROMPT=1).
+struct Picker {
+    int* d_out = nullptr;
+    int* d_hist = nullptr;
+    size_t hcap = 0;
+    uint64_t counter = 0;
+    int32_t pick(const float* d_logits, int V, const KS::SamplerParams& p0, const std::vector<int32_t>& hist) {
+        KS::SamplerParams p = p0;
+        p.counter = counter++;
+        p.greedy = p.temperature <= 0.f;
+        int hl = 0;
+        const bool pen = p.penalty_last_n != 0 && (p.penalty_repeat != 1.f || p.penalty_freq != 0.f || p.penalty_present != 0.f);
+        if (pen && !hist.empty()) {
+            const size_t n = p.penalty_last_n < 0 ? hist.size() : std::min(hist.size(), (size_t) p.penalty_last_n);
+            if (n > hcap) {
+                if (d_hist) CK(cudaFree(d_hist));
+                hcap = std::max<size_t>(n, 1024);
+                CK(cudaMalloc(&d_hist, hcap * 4));
+            }
+            CK(cudaMemcpyAsync(d_hist, hist.data() + (hist.size() - n), n * 4, cudaMemcpyHostToDevice, g_st));
+            hl = (int) n;
+        }
+        p.penalty_last_n = hl;   // sample_tokens exits on a window without a history
+        if (!d_out) CK(cudaMalloc(&d_out, 4));
+        KS::sample_tokens(d_logits, 1, V, hl ? d_hist : nullptr, hl, p, d_out, g_st);
+        int32_t t = 0;
+        CK(cudaMemcpyAsync(&t, d_out, 4, cudaMemcpyDeviceToHost, g_st));
+        CK(cudaStreamSynchronize(g_st));
+        return t;
+    }
 };
-/// The next token from the logits: greedy at temperature 0, else top-k / top-p / min-p over the softmax at `temp`.
-int32_t sample(const std::vector<float>& lg, const Sampling& sp, std::mt19937_64& rng) {
-    const int64_t V = (int64_t) lg.size();
-    int64_t best = 0;
-    for (int64_t i = 1; i < V; ++i)
-        if (lg[(size_t) i] > lg[(size_t) best]) best = i;
-    if (!std::isfinite(lg[(size_t) best])) die("the logits are not finite");
-    if (sp.temp <= 0) return (int32_t) best;
-    std::vector<std::pair<double, int32_t>> c;
-    c.reserve((size_t) V);
-    for (int64_t i = 0; i < V; ++i) c.push_back({std::exp((lg[(size_t) i] - lg[(size_t) best]) / sp.temp), (int32_t) i});
-    size_t keep = c.size();
-    if (sp.top_k > 0 && (size_t) sp.top_k < keep) keep = (size_t) sp.top_k;
-    std::partial_sort(c.begin(), c.begin() + (std::ptrdiff_t) keep, c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    c.resize(keep);
-    double sum = 0;
-    for (const auto& x : c) sum += x.first;
-    if (sp.min_p > 0) {   // relative to the most likely token (its weight is 1 here)
-        size_t n = 0;
-        while (n < c.size() && c[n].first >= sp.min_p) ++n;
-        c.resize(std::max<size_t>(n, 1));
-    }
-    if (sp.top_p < 1) {
-        double run = 0;
-        size_t n = 0;
-        while (n < c.size() && run < sp.top_p * sum) run += c[n++].first;
-        c.resize(std::max<size_t>(n, 1));
-    }
-    sum = 0;
-    for (const auto& x : c) sum += x.first;
-    std::uniform_real_distribution<double> u(0.0, sum);
-    double t = u(rng);
-    for (const auto& x : c)
-        if ((t -= x.first) <= 0) return x.second;
-    return c.back().second;
+/// GLM's own default: greedy (temperature 0, no truncation) unless asked
+KS::SamplerParams default_params(double temp, uint64_t seed) {
+    KS::SamplerParams p;
+    p.temperature = (float) temp, p.top_k = 0, p.top_p = 1.f, p.min_p = 0.f, p.seed = seed;
+    return p;
 }
 
 /// --serve: the line protocol Strata's server (serve/server.py StrataEngine) speaks to its engine, so the server, the
@@ -1309,9 +1312,9 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
     });
     reader.detach();
     const int64_t V = r.head.n_out;
-    std::vector<float> lg((size_t) V);
     std::vector<int32_t> hist;   // the tokens the state holds, in order (hist.size() == r.pos)
-    std::mt19937_64 rng(seed);
+    Picker picker;
+    const bool pen_prompt = KS::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"));
     std::printf("READY %lld stop\n", (long long) r.ctx_max);
     std::fflush(stdout);
     for (;;) {
@@ -1334,7 +1337,7 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
         }
         long long max_new = 0;
         in >> max_new;
-        Sampling sp;
+        KS::SamplerParams sp = default_params(0, seed);
         std::vector<int32_t> ids;
         std::string w;
         bool bad = false;
@@ -1343,12 +1346,16 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
             if (eq != std::string::npos && eq > 0 && !std::isdigit((unsigned char) w[0])) {
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
                 try {
-                    if (k == "temperature") sp.temp = std::stod(v);
-                    else if (k == "top_p") sp.top_p = std::stod(v);
+                    if (k == "temperature") sp.temperature = std::stof(v);
+                    else if (k == "top_p") sp.top_p = std::stof(v);
                     else if (k == "top_k") sp.top_k = std::stoi(v);
-                    else if (k == "min_p") sp.min_p = std::stod(v);
-                    else if (k == "seed") rng.seed(std::stoull(v));
-                    // other keys (penalties, holds, drafting) are the main engine's: ignored here
+                    else if (k == "min_p") sp.min_p = std::stof(v);
+                    else if (k == "seed") sp.seed = std::stoull(v);
+                    else if (k == "penalty_last_n") sp.penalty_last_n = std::stoi(v);
+                    else if (k == "penalty_repeat") sp.penalty_repeat = std::stof(v);
+                    else if (k == "penalty_freq") sp.penalty_freq = std::stof(v);
+                    else if (k == "penalty_present") sp.penalty_present = std::stof(v);
+                    // other keys (holds, drafting) are the main engine's: ignored here
                 } catch (...) { bad = true; }
             } else {
                 try { ids = parse_ids(w); } catch (...) { bad = true; }
@@ -1377,10 +1384,11 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
         const auto t1 = std::chrono::steady_clock::now();
         const char* finish = "length";
         long long made = 0;
+        std::vector<int32_t> pen_hist = pen_prompt || ids.empty() ? ids : std::vector<int32_t>(1, ids.back());
         while (made < max_new) {
             if (stop_req) { finish = "cancel"; break; }
-            CK(cudaMemcpy(lg.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
-            const int32_t t = sample(lg, sp, rng);
+            const int32_t t = picker.pick(r.logits, (int) V, sp, pen_hist);
+            pen_hist.push_back(t);
             std::printf("T %d\n", t);
             std::fflush(stdout);
             ++made;
@@ -1522,16 +1530,11 @@ int run(int argc, char** argv) {
     std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
     std::fflush(stdout);
 
-    std::mt19937_64 rng(seed);
     const int64_t V = r.head.n_out;
-    std::vector<float> lg((size_t) V);
-    Sampling sp;
-    sp.temp = temp;
-    auto pick = [&]() -> int32_t {
-        CK(cudaMemcpyAsync(lg.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost, g_st));
-        CK(cudaStreamSynchronize(g_st));
-        return sample(lg, sp, rng);
-    };
+    Picker picker;
+    const KS::SamplerParams sp = default_params(temp, seed);
+    const std::vector<int32_t> no_hist;
+    auto pick = [&]() -> int32_t { return picker.pick(r.logits, (int) V, sp, no_hist); };
 
     const auto tp = std::chrono::steady_clock::now();
     r.prompt(prompt);
