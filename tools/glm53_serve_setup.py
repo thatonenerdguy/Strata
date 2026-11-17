@@ -10,9 +10,9 @@ What it writes into DIR (default: a "strata-glm53" folder beside the model):
                         server speaks to every Strata engine), with the model's stop tokens and the expert profile beside
                         the model (read at start when it exists, written back at every stop, as the wrapper does)
 
-The server then gives the model its OpenAI / Anthropic endpoints and the chat page as for the other models.  Not yet:
-GLM's own tool-call format (plain chat and reasoning work; tool calls are left as text), MTP drafting, several requests
-at once.
+The server then gives the model its OpenAI / Anthropic endpoints and the chat page as for the other models, and reads GLM's
+own tool calls (`<arg_key>` / `<arg_value>`, chosen from the template: serve/frontend.py GlmOutputParser).  Not yet: MTP
+drafting, several requests at once.
 """
 from __future__ import annotations
 

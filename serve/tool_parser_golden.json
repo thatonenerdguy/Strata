@@ -280,5 +280,143 @@
     ]
    ]
   }
+ ],
+ "glm": [
+  {
+   "name": "text only",
+   "input": "Hello there.\nNothing to call.",
+   "thinking": false,
+   "events": [
+    [
+     "content",
+     "Hello there.\nNothing to call.",
+     null,
+     null
+    ]
+   ]
+  },
+  {
+   "name": "one call",
+   "input": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": false,
+   "events": [
+    [
+     "tool_call",
+     "",
+     "get_weather",
+     {
+      "city": "Paris",
+      "days": 3
+     }
+    ]
+   ]
+  },
+  {
+   "name": "text then call",
+   "input": "Let me check.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>New York</arg_value>\n</tool_call>",
+   "thinking": false,
+   "events": [
+    [
+     "content",
+     "Let me check.",
+     null,
+     null
+    ],
+    [
+     "tool_call",
+     "",
+     "get_weather",
+     {
+      "city": "New York"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "two calls, a multi-line value",
+   "input": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><tool_call>write_file<arg_key>path</arg_key><arg_value>a.txt</arg_value><arg_key>content</arg_key><arg_value>\nline1\n<b>x</b>\n</arg_value></tool_call>",
+   "thinking": false,
+   "events": [
+    [
+     "tool_call",
+     "",
+     "get_weather",
+     {
+      "city": "Rome"
+     }
+    ],
+    [
+     "tool_call",
+     "",
+     "write_file",
+     {
+      "path": "a.txt",
+      "content": "\nline1\n<b>x</b>\n"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "thinking then call",
+   "input": "The user wants the weather.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>",
+   "thinking": true,
+   "events": [
+    [
+     "reasoning",
+     "The user wants the weather.",
+     null,
+     null
+    ],
+    [
+     "tool_call",
+     "",
+     "get_weather",
+     {
+      "city": "Oslo"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "closer left out at the end",
+   "input": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value>",
+   "thinking": false,
+   "events": [
+    [
+     "tool_call",
+     "",
+     "get_weather",
+     {
+      "city": "Oslo"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "undeclared tool stays text",
+   "input": "<tool_call>rm_rf<arg_key>p</arg_key><arg_value>/</arg_value></tool_call>",
+   "thinking": false,
+   "events": [
+    [
+     "content",
+     "<tool_call>rm_rf<arg_key>p</arg_key><arg_value>/</arg_value></tool_call>",
+     null,
+     null
+    ]
+   ]
+  },
+  {
+   "name": "prose naming the tag",
+   "input": "I would use a <tool_call> block here.",
+   "thinking": false,
+   "events": [
+    [
+     "content",
+     "I would use a <tool_call> block here.",
+     null,
+     null
+    ]
+   ]
+  }
  ]
 }

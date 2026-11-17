@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 from serve import toolformat
-from serve.frontend import ChatTemplate, JsonOutputParser, OutputParser, parser_for_template
+from serve.frontend import ChatTemplate, GlmOutputParser, JsonOutputParser, OutputParser, parser_for_template
 
 ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = json.loads((ROOT / "serve" / "tool_parser_golden.json").read_text(encoding="utf-8"))
@@ -47,6 +47,31 @@ For each function call, return a json object with function name and arguments wi
 {%- if add_generation_prompt %}
 <|im_start|>assistant
 {%- endif %}"""
+
+# the tool section of GLM-5.3-Flash's template (Unsloth's GGUF), and how it writes an assistant's calls back
+GLM = """[gMASK]<sop>{%- if tools -%}<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{% for tool in tools %}{{ tool | tojson }}
+{% endfor %}</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}<|user|>{{ m.content }}
+{%- elif m.role == 'assistant' -%}<|assistant|><think></think>{{ m.content }}
+{%- for tc in m.tool_calls or [] -%}{%- set tc = tc.function if tc.function else tc -%}
+{{- '<tool_call>' + tc.name -}}
+{% for k, v in tc.arguments.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson if v is not string else v }}</arg_value>{% endfor %}</tool_call>
+{%- endfor -%}
+{%- elif m.role == 'tool' -%}<|observation|><tool_response>{{ m.content }}</tool_response>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}"""
 
 NO_TOOLS = "{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor %}"
 ODD = "{%- if tools %}Call a tool by writing [TOOL name(args)] and nothing else.{%- endif %}{{ messages }}"
@@ -85,6 +110,7 @@ class Detection(unittest.TestCase):
     def test_other_forms(self):
         self.assertEqual(toolformat.tool_format(fixture_template("ds41_ud_q8_k_xl")), "dsml")
         self.assertEqual(toolformat.tool_format(HERMES), "json")
+        self.assertEqual(toolformat.tool_format(GLM), "glm")
         self.assertEqual(toolformat.tool_format(NO_TOOLS), "none")
         self.assertEqual(toolformat.tool_format(ODD), "other")
         self.assertEqual(toolformat.tool_format(""), "none")
@@ -110,6 +136,10 @@ class Selection(unittest.TestCase):
                     NO_TOOLS, ODD, "", None]:
             self.assertIs(parser_for_template(src), OutputParser)
 
+    def test_glm_template_gets_the_glm_parser(self):
+        self.assertIs(parser_for_template(GLM), GlmOutputParser)
+        self.assertTrue(issubclass(GlmOutputParser, OutputParser))
+
     def test_json_template_gets_the_json_parser(self):
         self.assertIs(parser_for_template(HERMES), JsonOutputParser)
         self.assertTrue(issubclass(JsonOutputParser, OutputParser))
@@ -123,6 +153,14 @@ class Selection(unittest.TestCase):
             self.assertIs(Service(MockEngine(tok, "ok"), tok, ChatTemplate(h)).parser_cls, JsonOutputParser)
             shipped = ChatTemplate(ROOT / "serve" / "chat_template.jinja")
             self.assertIs(Service(MockEngine(tok, "ok"), tok, shipped).parser_cls, OutputParser)
+            self.assertEqual(Service(MockEngine(tok, "ok"), tok, shipped).force_text("<tool_call>\n"), "<tool_call>\n")
+            g = Path(d) / "glm.jinja"
+            g.write_text(GLM, encoding="utf-8")
+            svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(g))
+            self.assertIs(svc.parser_cls, GlmOutputParser)
+            self.assertEqual(svc.force_text("<tool_call>\n<function=get_weather>\n"), "<tool_call>get_weather")   # tool_choice, GLM's spelling
+            self.assertEqual(svc.force_text("<tool_call>\n"), "<tool_call>")
+            self.assertIsNone(svc.force_text(None))
 
 
 class UnknownPreTokenizerAtStart(unittest.TestCase):
@@ -171,6 +209,45 @@ class Golden(unittest.TestCase):
 
     def test_json_form_through_the_class_a_json_template_selects(self):
         self.check(parser_for_template(HERMES), GOLDEN["json"])
+
+    def test_glm_form_through_the_class_a_glm_template_selects(self):
+        self.check(parser_for_template(GLM), GOLDEN["glm"])
+        p = GlmOutputParser(thinking=False, tools=GOLDEN["tools"], recover=False)     # the form itself, not a recovery
+        calls = [e.call for e in p.feed(GOLDEN["glm"][1]["input"]) + p.finish() if e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("get_weather", {"city": "Paris", "days": 3})])
+
+    def test_glm_template_writes_back_what_the_parser_reads(self):
+        # a call the parser reads, rendered into the next prompt by the template, is the text the model wrote
+        raw = GOLDEN["glm"][1]["input"]
+        p = GlmOutputParser(thinking=False, tools=GOLDEN["tools"])
+        call = [e.call for e in p.feed(raw) + p.finish() if e.kind == "tool_call"][0]
+        with tempfile.TemporaryDirectory() as d:
+            g = Path(d) / "glm.jinja"
+            g.write_text(GLM, encoding="utf-8")
+            prompt = ChatTemplate(g).render([{"role": "user", "content": "weather?"},
+                                             {"role": "assistant", "content": "", "tool_calls": [
+                                                 {"type": "function", "function": {"name": call.name, "arguments": call.arguments}}]}],
+                                            tools=[{"type": "function", "function": t} for t in GOLDEN["tools"]],
+                                            add_generation_prompt=False)
+        self.assertIn(raw, prompt)
+
+    def test_glm_template_with_thinking_off_closes_the_reasoning(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = Path(d) / "glm.jinja"
+            g.write_text(GLM, encoding="utf-8")
+            t = ChatTemplate(g)
+            msgs = [{"role": "user", "content": "hi"}]
+            self.assertTrue(t.render(msgs).endswith("<|assistant|><think>"))
+            self.assertTrue(t.render(msgs, enable_thinking=False).endswith("<|assistant|><think></think>"))
+        shipped = ChatTemplate(ROOT / "serve" / "chat_template.jinja")      # a template with its own switch renders as it did
+        self.assertEqual(shipped.render(msgs, enable_thinking=False),
+                         shipped.template.render(messages=msgs, tools=None, add_generation_prompt=True, enable_thinking=False))
+
+    def test_glm_parser_leaves_the_xml_form_to_outputparser(self):
+        for c in GOLDEN["xml"]:
+            if c["name"] != "undeclared tool stays text":
+                with self.subTest(c["name"]):
+                    self.assertEqual(normalised(GlmOutputParser, c["input"], c["thinking"], 1, True), c["events"])
 
     def test_json_parser_reads_json_without_the_recovery_switch(self):
         raw = GOLDEN["json"][0]["input"]

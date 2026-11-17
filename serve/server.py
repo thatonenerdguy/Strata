@@ -4980,6 +4980,7 @@ class Service:
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family: set_family() below (None: the Qwen form)
         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
+        self._force_text = getattr(self.parser_cls, "force_text", None)   # a tool_choice's forced opening in the template's spelling (GLM)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
