@@ -34,6 +34,7 @@
 #include "gguf_dev.cuh"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -94,6 +95,7 @@ struct Layer {
     DMat wq, wk, wv, f_a, f_b, w_beta, g_a, g_b, wo;
     FMat conv_q, conv_k, conv_v, dt, A, o_norm;
     float *cs_q = nullptr, *cs_k = nullptr, *cs_v = nullptr, *S = nullptr;
+    float *S_snap = nullptr, *cs_snap = nullptr;   // --mtp: the state after a verify window's first token (q, k, v convs back to back)
     // MLA
     DMat q_a, q_b, kv_a, ix_q, ix_k, ix_g, ix_p;
     FMat q_a_norm, kv_a_norm, k_b, v_b, ix_kn, ix_kb, ix_ape;
@@ -145,12 +147,13 @@ struct ExpertCache {
         return base + (size_t) (n - L) * slot;
     }
     /// The lent slots back: each expert that left is copied into its own slot again (least recently used), the rest free.
-    void give_back(const std::vector<Layer>& layers, int64_t n_expert) {
+    void give_back(const std::vector<Layer>& layers, const Layer* mtp, int64_t n_expert) {
         if (lent == 0) return;
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<char> filled((size_t) lent, 0);
         for (const auto& sk : lent_keys) {
-            const Layer& ly = layers[(size_t) (sk.second / n_expert)];
+            const size_t li = (size_t) (sk.second / n_expert);
+            const Layer& ly = li < layers.size() ? layers[li] : *mtp;   // past the trunk: the MTP block
             const int e = (int) (sk.second % n_expert);
             uint8_t* dst = base + (size_t) sk.first * slot;
             CK(cudaMemcpyAsync(dst, ly.eg + (size_t) e * ly.egsz, ly.egsz, cudaMemcpyHostToDevice, g_st));
@@ -293,6 +296,55 @@ struct Streamer {
     }
 };
 
+namespace KS = strata::kernels;
+
+/// The next token, by Strata's sampler chain on the device (kernels/sampler.hpp: penalties -> top_k -> top_p -> min_p ->
+/// temperature -> pick, llama.cpp's order, Philox on (seed, counter)): the logits stay on the GPU and one id comes back.
+/// The penalty history is the request's (as the main engine's: the reply, from the last prompt token, unless
+/// STRATA_PENALTY_PROMPT=1).
+struct Picker {
+    int* d_out = nullptr;
+    int* d_hist = nullptr;
+    size_t hcap = 0;
+    uint64_t counter = 0;
+    int32_t pick(const float* d_logits, int V, const KS::SamplerParams& p0, const std::vector<int32_t>& hist) {
+        KS::SamplerParams p = p0;
+        p.counter = counter++;
+        p.greedy = p.temperature <= 0.f;
+        int hl = 0;
+        const bool pen = p.penalty_last_n != 0 && (p.penalty_repeat != 1.f || p.penalty_freq != 0.f || p.penalty_present != 0.f);
+        if (pen && !hist.empty()) {
+            const size_t n = p.penalty_last_n < 0 ? hist.size() : std::min(hist.size(), (size_t) p.penalty_last_n);
+            if (n > hcap) {
+                if (d_hist) CK(cudaFree(d_hist));
+                hcap = std::max<size_t>(n, 1024);
+                CK(cudaMalloc(&d_hist, hcap * 4));
+            }
+            CK(cudaMemcpyAsync(d_hist, hist.data() + (hist.size() - n), n * 4, cudaMemcpyHostToDevice, g_st));
+            hl = (int) n;
+        }
+        p.penalty_last_n = hl;   // sample_tokens exits on a window without a history
+        if (!d_out) CK(cudaMalloc(&d_out, 4));
+        KS::sample_tokens(d_logits, 1, V, hl ? d_hist : nullptr, hl, p, d_out, g_st);
+        int32_t t = 0;
+        CK(cudaMemcpyAsync(&t, d_out, 4, cudaMemcpyDeviceToHost, g_st));
+        CK(cudaStreamSynchronize(g_st));
+        return t;
+    }
+};
+/// GLM's own default: greedy (temperature 0, no truncation) unless asked
+KS::SamplerParams default_params(double temp, uint64_t seed) {
+    KS::SamplerParams p;
+    p.temperature = (float) temp, p.top_k = 0, p.top_p = 1.f, p.min_p = 0.f, p.seed = seed;
+    return p;
+}
+
+/// a[i] += b[i]: the MTP block's residual adds
+__global__ void k_add(float* a, const float* b, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+
 struct Runner {
     Ctx c;
     bool cpu_experts = true;
@@ -355,6 +407,21 @@ struct Runner {
     unsigned long long* d_gp = nullptr;
     int32_t *d_gs = nullptr, *d_ng = nullptr, *d_ed = nullptr, *d_et = nullptr;
     ExpertCache cache;
+    // --mtp: the GGUF's MTP (nextn) block drafts one token a step, the trunk verifies it in a 2-token step (greedy)
+    bool mtp_on = false;
+    Layer mtp;
+    FMat mtp_enorm, mtp_hnorm, mtp_norm;         // mtp_norm: nextn.shared_head_norm, or output_norm
+    DMat mtp_eh, mtp_head_own;                   // eh_proj; nextn.shared_head_head when the file has its own
+    const DMat* mtp_head = nullptr;
+    void* mtp_emb_dev = nullptr;                 // nextn.embed_tokens when the file has its own (else token_embd)
+    const uint8_t* mtp_emb_host = nullptr;
+    float *hpend = nullptr, *logits_m = nullptr;  // the MTP rows not yet run: their seeds [2][N]; the draft's logits
+    int64_t pend_pos = 0;                        // the first pending row's position
+    int pend_n = 0;                              // pending rows (the last one's next token is not known yet)
+    std::vector<int32_t> pend_tok;               // the next tokens of the pending rows but the last
+    bool snap_verify = false;                    // the step running is a verify window: KDA keeps its first token's state
+    int64_t n_drafts = 0, n_accepted = 0;
+    double mtp_s = 0;
     std::vector<std::vector<int32_t>> cells;   // per token of the step: the last full indexer's choice (shared layers reuse it)
     int64_t pos = 0;
 
@@ -444,7 +511,7 @@ struct Runner {
         if (cache.lent == 0) return;
         CK(cudaStreamSynchronize(g_st));
         lay_out(small_t, standing);
-        cache.give_back(layers, c.g.n_expert);
+        cache.give_back(layers, &mtp, c.g.n_expert);
     }
 
     static double mem_gb(const char* key) {   // a /proc/meminfo field in GB (0: unknown)
@@ -602,6 +669,44 @@ struct Runner {
         }
     }
 
+    /// --mtp: the MTP (nextn) block after the trunk, its norms and projections, and the KDA layers' verify snapshots.
+    void load_mtp() {
+        const auto& g = c.g;
+        const int64_t N = g.n_embd, L = g.n_layers;
+        if (g.n_mtp_layers < 1) die("--mtp: the model file has no MTP (nextn) block");
+        const std::string b = "blk." + std::to_string(L) + ".nextn.";
+        load_layer(mtp, L);
+        if (mtp.dense) die("--mtp: a dense MTP block is not handled");
+        mtp_eh = up_mat(c, b + "eh_proj.weight");
+        mtp_enorm = up_f32(c, b + "enorm.weight"), mtp_hnorm = up_f32(c, b + "hnorm.weight");
+        mtp_norm = c.gm->find(b + "shared_head_norm.weight") ? up_f32(c, b + "shared_head_norm.weight") : out_norm;
+        if (c.gm->find(b + "shared_head_head.weight")) mtp_head_own = up_mat(c, b + "shared_head_head.weight"), mtp_head = &mtp_head_own;
+        else mtp_head = &head;
+        if (const strata::TensorInfo* et = c.gm->find(b + "embed_tokens.weight")) {
+            const strata::TensorInfo& te = *c.gm->find("token_embd.weight");
+            if (et->type != te.type) die("--mtp: nextn.embed_tokens differs in type from token_embd: not handled");
+            const uint8_t* p = nullptr;
+            tensor(c, b + "embed_tokens.weight", &p);
+            mtp_emb_host = p;
+            if (emb_dev) {
+                const size_t bytes = (size_t) strata::tensor_payload_bytes(*et);
+                mtp_emb_dev = dbytes(bytes);
+                CK(cudaMemcpy(mtp_emb_dev, p, bytes, cudaMemcpyHostToDevice));
+                g_vram += bytes;
+            }
+        }
+        hpend = dalloc((size_t) (2 * N)), logits_m = dalloc((size_t) mtp_head->n_out);
+        const int64_t D = g.kda_inner(), C = g.ssm_d_conv;
+        for (Layer& y : layers)
+            if (!y.attn) {
+                y.S_snap = dalloc((size_t) (g.n_head * g.kda_head_dim * g.kda_head_dim));
+                y.cs_snap = dalloc((size_t) (3 * (C - 1) * D));
+                g_vram += (size_t) (3 * (C - 1) * D + g.n_head * g.kda_head_dim * g.kda_head_dim) * 4;
+            }
+        std::printf("  MTP block %lld loaded (greedy drafts, one a step): head %s, embedding %s; %.2f GB of weights in VRAM\n",
+                    (long long) L, mtp_head == &head ? "shared" : "own", mtp_emb_host ? "own" : "shared", g_vram / 1e9);
+    }
+
     void load(double cache_gb) {
         const auto& g = c.g;
         const int64_t N = g.n_embd;
@@ -631,6 +736,7 @@ struct Runner {
         head = up_mat(c, "output.weight");
         std::printf("  embedding %s, head %s (%s); %.2f GB of weights in VRAM\n", te.type_name(),
                     strata::ggml_type_name(head.type), head.path(), g_vram / 1e9);
+        if (mtp_on) load_mtp();
 
         // activations: H x kv_lora wide for q_abs / o_lat (t2, t5), the widest other row for the rest
         big_a = g.n_head * g.kv_lora;
@@ -641,8 +747,9 @@ struct Runner {
         // lays its buffers out in lent cache slots (begin_lend).  Without streaming, the standing buffers take a full step.
         const bool lending = stream_min > 0 && chunk >= stream_min;
         small_t = lending ? std::max(1, stream_min - 1) : chunk;
+        if (mtp_on) small_t = std::max(small_t, 2);   // a verify window is a 2-token step
         const int64_t T = small_t;
-        logits = dalloc((size_t) head.n_out);
+        logits = dalloc((size_t) head.n_out * 2);   // a verify window's two rows
         score = dalloc((size_t) (ctx_max / g.idx_kpool + 1));
         scr = (float*) dbytes((size_t) K::glm_mla_attend_scratch_bytes((int) g.n_head, ctx_max));
         dcells_cap = (size_t) ctx_max;
@@ -650,6 +757,7 @@ struct Runner {
         size_t maxF = 0, maxblob = 0;
         for (const Layer& y : layers)
             if (!y.dense) maxF = std::max(maxF, (size_t) y.L.n_ff), maxblob = std::max(maxblob, y.L.bytes);
+        if (mtp_on) maxF = std::max(maxF, (size_t) mtp.L.n_ff), maxblob = std::max(maxblob, mtp.L.bytes);
         max_ff = (int64_t) maxF;
 
         if (stream_min > 0 && chunk >= stream_min) {
@@ -742,16 +850,18 @@ struct Runner {
         const int H = (int) g.n_head, hd = (int) g.kda_head_dim, D = H * hd, C = (int) g.ssm_d_conv;
         float *q = t0, *k = t1, *v = t2, *p = t3;
         const bool many = T > 1;   // the prompt path: one launch for the T tokens
-        auto conv = [&](float* cs, const FMat& w, float* dst) {
-            if (many) K::glm_kda_conv_tokens(p, cs, w.d, dst, D, C, T, g_st);
+        const bool snap = snap_verify && many && y.S_snap != nullptr;   // a verify window: the first token's state too
+        const size_t cs_n = (size_t) ((C - 1) * D);
+        auto conv = [&](float* cs, const FMat& w, float* dst, int which) {
+            if (many) K::glm_kda_conv_tokens(p, cs, w.d, dst, D, C, T, g_st, snap ? y.cs_snap + which * cs_n : nullptr, 0);
             else K::glm_kda_conv(p, cs, w.d, dst, D, C, g_st);
         };
         proj(y.wq, xn, p, T);
-        conv(y.cs_q, y.conv_q, q);
+        conv(y.cs_q, y.conv_q, q, 0);
         proj(y.wk, xn, p, T);
-        conv(y.cs_k, y.conv_k, k);
+        conv(y.cs_k, y.conv_k, k, 1);
         proj(y.wv, xn, p, T);
-        conv(y.cs_v, y.conv_v, v);
+        conv(y.cs_v, y.conv_v, v, 2);
         K::glm_kda_l2_heads(q, H * T, hd, 1e-6f, g_st);
         K::glm_kda_l2_heads(k, H * T, hd, 1e-6f, g_st);
         float *fa = t4, *g1 = t5, *gg = t6, *beta = t7;
@@ -761,7 +871,7 @@ struct Runner {
         float* o = t3;
         if (many && K::glm_kda_delta_tokens_supported(hd)) {
             K::glm_kda_gates_tokens(g1, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg, beta, H, hd, T, g_st);
-            K::glm_kda_delta_tokens(y.S, q, k, v, gg, beta, o, H, hd, T, g_st);
+            K::glm_kda_delta_tokens(y.S, q, k, v, gg, beta, o, H, hd, T, g_st, snap ? y.S_snap : nullptr, 0);
         } else
         for (int t = 0; t < T; ++t) {
             K::glm_kda_gates(g1 + (size_t) t * D, y.dt.d, y.A.d, (float) g.kda_gate_lower_bound, gg + (size_t) t * D,
@@ -1070,8 +1180,9 @@ struct Runner {
         std::vector<float> wts(routing ? (size_t) (T * Kx) : 0);
         if (routing) CK(cudaMemcpyAsync(wts.data(), dw, wts.size() * 4, cudaMemcpyDeviceToHost, g_st));
         CK(cudaStreamSynchronize(g_st));
-        for (int32_t e : ids) heat[(size_t) (l * E + e)] += 1.0;
-        if (routing)
+        if (l < g.n_layers)   // the MTP block's routing is not the trunk's profile
+            for (int32_t e : ids) heat[(size_t) (l * E + e)] += 1.0;
+        if (routing && l < g.n_layers)
             for (int t = 0; t < T; ++t) {
                 const int32_t rec[2] = {(int32_t) l, (int32_t) Kx};
                 std::fwrite(rec, sizeof rec, 1, routing);
@@ -1178,7 +1289,7 @@ struct Runner {
 
     /// T tokens (at most `chunk`) through the trunk, at positions pos .. pos + T - 1; with `want_logits`, the last
     /// token's logits land in `logits`.  Decoding is T = 1.
-    void step(const int32_t* toks, int T, bool want_logits) {
+    void step(const int32_t* toks, int T, bool want_logits, int rows_out = 1) {
         const auto& g = c.g;
         const int64_t N = g.n_embd;
         if (T < 1 || T > cap_t) die("step: bad token count");
@@ -1196,12 +1307,155 @@ struct Runner {
             else moe(y, l, T);
             hc_post(T);
         }
-        if (want_logits) {
-            K::glm_hc_mean(streams + (size_t) (T - 1) * 4 * N, N, x, 1, g_st);
-            K::glm_rms_norm(x, out_norm.d, xn, N, (float) g.rms_eps, 1, g_st);
-            proj(head, xn, logits);
+        if (want_logits || mtp_on) {   // with --mtp every row's normed hidden: the MTP block's seeds, at t7 + 2N
+            const int hr = mtp_on ? T : 1;
+            K::glm_hc_mean(streams + (size_t) (T - hr) * 4 * N, N, x, hr, g_st);
+            K::glm_rms_norm(x, out_norm.d, xn, N, (float) g.rms_eps, hr, g_st);
+            if (mtp_on) CK(cudaMemcpyAsync(hrows(), xn, (size_t) hr * N * 4, cudaMemcpyDeviceToDevice, g_st));
+            if (want_logits) proj(head, xn + (size_t) (hr - rows_out) * N, logits, rows_out);
         }
         pos += T;
+    }
+    float* hrows() const { return t7 + 2 * c.g.n_embd; }   // the last step's normed hidden rows (t7: 3N+ wide a token)
+
+    /// The MTP block over T rows: row r reads token toks[r] at position p0 + r with the trunk's normed hidden seeds[r] of
+    /// the row before it (llama.cpp's nextn: eh_proj over [enorm(embed) | hnorm(h)], then a plain pre-norm block, MLA +
+    /// MoE, no hyper-connections).  With want_logits the last row's draft logits land in logits_m.
+    void mtp_forward(const int32_t* toks, int T, int64_t p0, const float* seeds, bool want_logits) {
+        const auto& g = c.g;
+        const int64_t N = g.n_embd;
+        const auto t0c = std::chrono::steady_clock::now();
+        const int64_t keep = pos;
+        pos = p0;
+        embed_rows(toks, T, x, true);
+        K::glm_rms_norm(x, mtp_enorm.d, t0, N, (float) g.rms_eps, T, g_st);
+        K::glm_rms_norm(seeds, mtp_hnorm.d, t1, N, (float) g.rms_eps, T, g_st);
+        CK(cudaMemcpy2DAsync(t2, (size_t) (2 * N) * 4, t0, (size_t) N * 4, (size_t) N * 4, (size_t) T, cudaMemcpyDeviceToDevice, g_st));
+        CK(cudaMemcpy2DAsync(t2 + N, (size_t) (2 * N) * 4, t1, (size_t) N * 4, (size_t) N * 4, (size_t) T, cudaMemcpyDeviceToDevice, g_st));
+        proj(mtp_eh, t2, x, T);
+        K::glm_rms_norm(x, mtp.attn_norm.d, xn, N, (float) g.rms_eps, T, g_st);
+        mla(mtp, T);
+        add_rows(x, out, (int64_t) T * N);
+        K::glm_rms_norm(x, mtp.ffn_norm.d, xn, N, (float) g.rms_eps, T, g_st);
+        moe(mtp, g.n_layers, T);
+        add_rows(x, out, (int64_t) T * N);
+        if (want_logits) {
+            K::glm_rms_norm(x + (size_t) (T - 1) * N, mtp_norm.d, xn, N, (float) g.rms_eps, 1, g_st);
+            proj(*mtp_head, xn, logits_m);
+        }
+        CK(cudaStreamSynchronize(g_st));
+        pos = keep;
+        mtp_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count();
+    }
+    /// After a trunk step of T tokens at p .. p + T - 1 (not a verify window): the MTP rows whose next token is now known
+    /// run (the pending ones before p, then rows p .. p + T - 2), in pieces the buffers hold, and row p + T - 1 waits.
+    void mtp_after_step(const int32_t* toks, int T, int64_t p) {
+        if (!mtp_on) return;
+        const int64_t N = c.g.n_embd;
+        float* h = hrows();
+        const bool chain = pend_n > 0 && pend_pos + pend_n == p;
+        std::vector<int32_t> tk;
+        int64_t p0 = p;
+        const float* seeds = h;
+        if (chain) {
+            CK(cudaMemcpyAsync(h - (size_t) pend_n * N, hpend, (size_t) pend_n * N * 4, cudaMemcpyDeviceToDevice, g_st));
+            seeds = h - (size_t) pend_n * N;
+            tk = pend_tok;
+            p0 = pend_pos;
+        }
+        for (int t = chain ? 0 : 1; t < T; ++t) tk.push_back(toks[t]);
+        const int n = (int) tk.size();   // rows with a known next token
+        for (int r0 = 0; r0 < n; r0 += cap_t) {
+            const int m = std::min(cap_t, n - r0);
+            mtp_forward(tk.data() + r0, m, p0 + r0, seeds + (size_t) r0 * N, false);
+        }
+        CK(cudaMemcpyAsync(hpend, h + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, g_st));
+        pend_n = 1, pend_pos = p + T - 1, pend_tok.clear();
+    }
+    /// A trunk step whose MTP rows follow (the prompt, a plain decode step).
+    void feed(const int32_t* toks, int T, bool want_logits) {
+        const int64_t p = pos;
+        step(toks, T, want_logits);
+        mtp_after_step(toks, T, p);
+    }
+    void embed_rows(const int32_t* toks, int T, float* dst, bool mtp_table = false) {
+        const int64_t N = c.g.n_embd;
+        const bool own = mtp_table && mtp_emb_host;
+        if (emb_dev) {
+            CK(cudaMemcpyAsync(dtok, toks, (size_t) T * 4, cudaMemcpyHostToDevice, g_st));
+            K::iq_embed_rows((int) emb_type, own ? mtp_emb_dev : emb_dev, emb_row, dtok, T, N, dst, g_st);
+            CK(cudaStreamSynchronize(g_st));
+        } else {
+            for (int t = 0; t < T; ++t) {
+                const std::vector<float> r = dequant(emb_type, (own ? mtp_emb_host : emb_host) + (size_t) toks[t] * emb_row, N);
+                CK(cudaMemcpyAsync(dst + (size_t) t * N, r.data(), (size_t) N * 4, cudaMemcpyHostToDevice, g_st));
+                CK(cudaStreamSynchronize(g_st));
+            }
+        }
+    }
+    void add_rows(float* a, const float* b, int64_t n) {
+        k_add<<<(unsigned) ((n + 255) / 256), 256, 0, g_st>>>(a, b, n);
+        CK(cudaGetLastError());
+    }
+
+    /// Greedy decoding with MTP drafts (logits holds the trunk's logits for the next token, its row pending): pick t,
+    /// draft d from the MTP block, verify [t, d] in one 2-token step; d is kept when the trunk's pick after t is d (then
+    /// the pick after d comes free), else the KDA layers take back their state after t alone and the position steps
+    /// back one.  emit(token) false stops.  Returns the tokens the trunk took in (the state's), in order.
+    std::vector<int32_t> decode_mtp(long long max_new, Picker& pk, const std::function<bool(int32_t)>& emit, long long& made) {
+        const auto& g = c.g;
+        const int64_t N = g.n_embd, V = head.n_out;
+        const KS::SamplerParams greedy = default_params(0, 0);
+        const std::vector<int32_t> none;
+        std::vector<int32_t> fed;
+        made = 0;
+        while (made < max_new) {
+            const int32_t t = pk.pick(logits, (int) V, greedy, none);
+            ++made;
+            if (!emit(t) || made >= max_new) break;
+            // the draft: the pending MTP rows with t as the last one's next token
+            std::vector<int32_t> tk = pend_tok;
+            tk.push_back(t);
+            if (pend_n != (int) tk.size()) die("mtp: the pending rows are out of step");
+            mtp_forward(tk.data(), pend_n, pend_pos, hpend, true);
+            pend_n = 0, pend_tok.clear();
+            const int32_t d = pk.pick(logits_m, (int) mtp_head->n_out, greedy, none);
+            // the verify window
+            const int64_t Q = pos;
+            const int32_t w[2] = {t, d};
+            snap_verify = true;
+            step(w, 2, true, 2);
+            snap_verify = false;
+            ++n_drafts;
+            const int32_t a0 = pk.pick(logits, (int) V, greedy, none);
+            fed.push_back(t);
+            float* h = hrows();
+            if (a0 == d) {   // kept: the pick after d is row 1's
+                ++n_accepted;
+                fed.push_back(d);
+                CK(cudaMemcpyAsync(logits, logits + V, (size_t) V * 4, cudaMemcpyDeviceToDevice, g_st));
+                CK(cudaMemcpyAsync(hpend, h, (size_t) 2 * N * 4, cudaMemcpyDeviceToDevice, g_st));
+                pend_n = 2, pend_pos = Q, pend_tok = {d};
+                ++made;
+                if (!emit(d)) break;
+            } else {   // back to the state after t: the KDA layers' first-token states, one position
+                const int64_t D = g.kda_inner(), C = g.ssm_d_conv;
+                const size_t cs_n = (size_t) ((C - 1) * D);
+                for (Layer& y : layers)
+                    if (!y.attn) {
+                        CK(cudaMemcpyAsync(y.S, y.S_snap, (size_t) (g.n_head * g.kda_head_dim * g.kda_head_dim) * 4,
+                                           cudaMemcpyDeviceToDevice, g_st));
+                        CK(cudaMemcpyAsync(y.cs_q, y.cs_snap, cs_n * 4, cudaMemcpyDeviceToDevice, g_st));
+                        CK(cudaMemcpyAsync(y.cs_k, y.cs_snap + cs_n, cs_n * 4, cudaMemcpyDeviceToDevice, g_st));
+                        CK(cudaMemcpyAsync(y.cs_v, y.cs_snap + 2 * cs_n, cs_n * 4, cudaMemcpyDeviceToDevice, g_st));
+                    }
+                pos = Q + 1;
+                CK(cudaMemcpyAsync(hpend, h, (size_t) N * 4, cudaMemcpyDeviceToDevice, g_st));
+                pend_n = 1, pend_pos = Q, pend_tok.clear();
+            }
+        }
+        CK(cudaStreamSynchronize(g_st));
+        return fed;
     }
     /// The prompt from ids[from] on, `chunk` tokens a step; the last token's logits in `logits`.
     /// The prompt in steps cut as Strata's engine cuts a segment (prefill/equal_cut_rule.hpp, one GPU): a prompt longer
@@ -1222,7 +1476,7 @@ struct Runner {
         last_step = (int) step_n;
         for (size_t i = from; i < ids.size(); i += (size_t) step_n) {
             const int T = (int) std::min<size_t>((size_t) step_n, ids.size() - i);
-            step(ids.data() + i, T, i + (size_t) T == ids.size());
+            feed(ids.data() + i, T, i + (size_t) T == ids.size());
         }
         end_lend();
     }
@@ -1239,6 +1493,7 @@ struct Runner {
         CK(cudaStreamSynchronize(g_st));
         cells.clear();
         pos = 0;
+        pend_n = 0, pend_tok.clear();
     }
 };
 
@@ -1249,49 +1504,6 @@ std::vector<int32_t> parse_ids(const std::string& s) {
     while (std::getline(ss, t, ','))
         if (!t.empty()) v.push_back((int32_t) std::stol(t));
     return v;
-}
-
-namespace KS = strata::kernels;
-
-/// The next token, by Strata's sampler chain on the device (kernels/sampler.hpp: penalties -> top_k -> top_p -> min_p ->
-/// temperature -> pick, llama.cpp's order, Philox on (seed, counter)): the logits stay on the GPU and one id comes back.
-/// The penalty history is the request's (as the main engine's: the reply, from the last prompt token, unless
-/// STRATA_PENALTY_PROMPT=1).
-struct Picker {
-    int* d_out = nullptr;
-    int* d_hist = nullptr;
-    size_t hcap = 0;
-    uint64_t counter = 0;
-    int32_t pick(const float* d_logits, int V, const KS::SamplerParams& p0, const std::vector<int32_t>& hist) {
-        KS::SamplerParams p = p0;
-        p.counter = counter++;
-        p.greedy = p.temperature <= 0.f;
-        int hl = 0;
-        const bool pen = p.penalty_last_n != 0 && (p.penalty_repeat != 1.f || p.penalty_freq != 0.f || p.penalty_present != 0.f);
-        if (pen && !hist.empty()) {
-            const size_t n = p.penalty_last_n < 0 ? hist.size() : std::min(hist.size(), (size_t) p.penalty_last_n);
-            if (n > hcap) {
-                if (d_hist) CK(cudaFree(d_hist));
-                hcap = std::max<size_t>(n, 1024);
-                CK(cudaMalloc(&d_hist, hcap * 4));
-            }
-            CK(cudaMemcpyAsync(d_hist, hist.data() + (hist.size() - n), n * 4, cudaMemcpyHostToDevice, g_st));
-            hl = (int) n;
-        }
-        p.penalty_last_n = hl;   // sample_tokens exits on a window without a history
-        if (!d_out) CK(cudaMalloc(&d_out, 4));
-        KS::sample_tokens(d_logits, 1, V, hl ? d_hist : nullptr, hl, p, d_out, g_st);
-        int32_t t = 0;
-        CK(cudaMemcpyAsync(&t, d_out, 4, cudaMemcpyDeviceToHost, g_st));
-        CK(cudaStreamSynchronize(g_st));
-        return t;
-    }
-};
-/// GLM's own default: greedy (temperature 0, no truncation) unless asked
-KS::SamplerParams default_params(double temp, uint64_t seed) {
-    KS::SamplerParams p;
-    p.temperature = (float) temp, p.top_k = 0, p.top_p = 1.f, p.min_p = 0.f, p.seed = seed;
-    return p;
 }
 
 /// --serve: the line protocol Strata's server (serve/server.py StrataEngine) speaks to its engine, so the server, the
@@ -1394,17 +1606,29 @@ int serve(Runner& r, std::vector<int32_t> stop, uint64_t seed) {
         const char* finish = "length";
         long long made = 0;
         std::vector<int32_t> pen_hist = pen_prompt || ids.empty() ? ids : std::vector<int32_t>(1, ids.back());
-        while (made < max_new) {
-            if (stop_req) { finish = "cancel"; break; }
-            const int32_t t = picker.pick(r.logits, (int) V, sp, pen_hist);
-            pen_hist.push_back(t);
-            std::printf("T %d\n", t);
-            std::fflush(stdout);
-            ++made;
-            if (std::find(stop.begin(), stop.end(), t) != stop.end()) { finish = "stop"; break; }
-            if (made >= max_new) break;
-            r.step(&t, 1, true);
-            hist.push_back(t);
+        const bool pen = sp.penalty_last_n != 0 && (sp.penalty_repeat != 1.f || sp.penalty_freq != 0.f || sp.penalty_present != 0.f);
+        if (r.mtp_on && sp.temperature <= 0.f && !pen) {   // greedy: MTP drafts, verified two tokens a step
+            const std::vector<int32_t> fed = r.decode_mtp(max_new, picker, [&](int32_t t) {
+                std::printf("T %d\n", t);
+                std::fflush(stdout);
+                if (std::find(stop.begin(), stop.end(), t) != stop.end()) { finish = "stop"; return false; }
+                if (stop_req) { finish = "cancel"; return false; }
+                return true;
+            }, made);
+            hist.insert(hist.end(), fed.begin(), fed.end());
+        } else {
+            while (made < max_new) {
+                if (stop_req) { finish = "cancel"; break; }
+                const int32_t t = picker.pick(r.logits, (int) V, sp, pen_hist);
+                pen_hist.push_back(t);
+                std::printf("T %d\n", t);
+                std::fflush(stdout);
+                ++made;
+                if (std::find(stop.begin(), stop.end(), t) != stop.end()) { finish = "stop"; break; }
+                if (made >= max_new) break;
+                r.feed(&t, 1, true);
+                hist.push_back(t);
+            }
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
         std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu\n", made, ids.size(), prompt_ms, decode_ms, finish, reuse);
@@ -1425,7 +1649,7 @@ int run(int argc, char** argv) {
     int cpu_exp = 1, threads = 0, chunk = 0, stream_min = 64, stream_threads = 8, gemm_min = 0;
     bool pin_experts = false;
     double pin_reserve_gb = 16;
-    bool check_prompt = false, serve_mode = false;
+    bool check_prompt = false, serve_mode = false, mtp = false;
     std::string profile_in, profile_out, dump_routing;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -1458,6 +1682,18 @@ int run(int argc, char** argv) {
         else if (a == "--stream-min") stream_min = std::stoi(next());
         else if (a == "--stream-threads") stream_threads = std::max(0, std::stoi(next()));
         else if (a == "--pin-experts") pin_experts = std::stoi(next()) != 0;
+        else if (a == "--mtp") {
+            // drafts a step, as the Qwen3.6 path's --mtp N (the GGUF's own block; Flash-Next's "--mtp <dir>" means
+            // nothing here).  One draft for now.
+            const std::string v = next();
+            if (!v.empty() && std::isdigit((unsigned char) v[0])) {
+                const int n = std::stoi(v);
+                if (n > 1) std::fprintf(stderr, "glm_generate: --mtp %d: one draft a step for now\n", n);
+                mtp = n > 0;
+            } else {
+                std::fprintf(stderr, "glm_generate: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N)\n", v.c_str());
+            }
+        }
         else if (a == "--pin-reserve-gb") pin_reserve_gb = std::max(0.0, std::stod(next()));
         else if (a == "--gemm-min-rows") gemm_min = std::max(0, std::stoi(next()));
         else if (a == "--check-prompt") check_prompt = true;
@@ -1490,6 +1726,7 @@ int run(int argc, char** argv) {
     r.chunk = r.cpu_experts ? std::max(1, std::min(chunk, 8192)) : 1;
     r.stream_min = stream_min, r.stream_threads = stream_threads, r.gemm_min = gemm_min;
     r.pin_experts = pin_experts, r.pin_reserve_gb = pin_reserve_gb;
+    r.mtp_on = mtp;
     if (r.cpu_experts) {
         if (!KC::native_experts_available()) die("this build has no ggml-cpu expert path (--cpu-experts 0 streams them instead)");
         // Strata's pool picks the threads itself (one pinned worker per physical core but the first, where this
@@ -1559,7 +1796,7 @@ int run(int argc, char** argv) {
         CK(cudaMemcpy(a.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
         r.reset();
         const auto t1 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < prompt.size(); ++i) r.step(&prompt[i], 1, i + 1 == prompt.size());
+        for (size_t i = 0; i < prompt.size(); ++i) r.feed(&prompt[i], 1, i + 1 == prompt.size());
         const double one_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
         CK(cudaMemcpy(b.data(), r.logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
         double dmax = 0, num = 0, den = 0;
@@ -1580,16 +1817,30 @@ int run(int argc, char** argv) {
     std::fflush(stdout);
     const auto tg = std::chrono::steady_clock::now();
     int made = 0;
-    for (; made < n_gen; ++made) {
-        const int32_t t = pick();
-        std::printf("%d\n", t);
-        std::fflush(stdout);
-        if (std::find(stop.begin(), stop.end(), t) != stop.end()) { ++made; break; }
-        if (made + 1 < n_gen) r.step(&t, 1, true);
+    if (r.mtp_on && temp <= 0) {   // greedy: MTP drafts, verified two tokens a step
+        long long m = 0;
+        r.decode_mtp(n_gen, picker, [&](int32_t t) {
+            std::printf("%d\n", t);
+            std::fflush(stdout);
+            return std::find(stop.begin(), stop.end(), t) == stop.end();
+        }, m);
+        made = (int) m;
+    } else {
+        for (; made < n_gen; ++made) {
+            const int32_t t = pick();
+            std::printf("%d\n", t);
+            std::fflush(stdout);
+            if (std::find(stop.begin(), stop.end(), t) != stop.end()) { ++made; break; }
+            if (made + 1 < n_gen) r.feed(&t, 1, true);
+        }
     }
     const double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
     std::printf("END_IDS\n");
     std::printf("generated %d tokens in %.1f s (%.2f tok/s)\n", made, gen_s, made / std::max(gen_s, 1e-9));
+    if (r.mtp_on)
+        std::printf("mtp: %lld of %lld drafts accepted (%.1f%%), %.1f s in the MTP block%s\n", (long long) r.n_accepted,
+                    (long long) r.n_drafts, 100.0 * r.n_accepted / std::max<int64_t>(r.n_drafts, 1), r.mtp_s,
+                    temp > 0 ? " (sampling: no drafts, greedy only for now)" : "");
     std::printf("experts: %lld on the GPU (%lld cache hits, %lld copied in), %lld on the CPU; %.1f s copying, %.1f s in "
                 "CPU experts (prompt included)\n",
                 (long long) r.n_gpu, (long long) r.cache.hits, (long long) r.cache.misses, (long long) r.n_cpu,

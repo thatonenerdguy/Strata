@@ -28,12 +28,15 @@ void glm_kda_delta_step(float* S, const float* q, const float* k, const float* v
 /// The prompt path: T tokens at once, in order, with the per-token calls' arithmetic (conv and gates: the same bits as T calls; the delta rule: within FP32 rounding).  p / out /
 /// g1 / g / q / k / v / o hold T rows of D = H * hd, beta T rows of H.  glm_kda_conv_tokens: C at most 9.
 /// glm_kda_delta_tokens keeps each head's state in registers for the T steps: hd 64 or 128 (glm_kda_delta_tokens_supported).
-void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream);
+/// snap / snap_at (both kernels, optional): the state right after token snap_at is also written to snap (same layout as
+/// the state), so a speculative verify window can keep only its first token.
+void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream,
+                         float* snap = nullptr, int snap_at = -1);
 void glm_kda_gates_tokens(const float* g1, const float* dt_bias, const float* A, float lower_bound, float* g, float* beta,
                           int H, int hd, int T, void* stream);
 bool glm_kda_delta_tokens_supported(int hd);
 void glm_kda_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
-                          float* o, int H, int hd, int T, void* stream);
+                          float* o, int H, int hd, int T, void* stream, float* snap = nullptr, int snap_at = -1);
 
 /// Per head: o = rms_norm(o) * w * sigmoid(gate), in place (gate [H][hd], w [hd]).
 void glm_kda_out_norm(float* o, const float* w, const float* gate, int H, int hd, float eps, void* stream);

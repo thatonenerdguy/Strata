@@ -103,7 +103,7 @@ __global__ void k_out_norm(float* o, const float* w, const float* gate, int hd, 
 
 // k_conv over T tokens (rows of D), in order: the same arithmetic per token, the window kept in registers
 template <int CM>
-__global__ void k_conv_tokens(const float* p, float* st, const float* w, float* out, int D, int C, int T) {
+__global__ void k_conv_tokens(const float* p, float* st, const float* w, float* out, int D, int C, int T, float* snap, int snap_at) {
     const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (c >= D) return;
     const float* wc = w + (size_t) c * C;
@@ -117,6 +117,8 @@ __global__ void k_conv_tokens(const float* p, float* st, const float* w, float* 
         out[(size_t) t * D + c] = a * sigm(a);
         for (int k = 0; k + 1 < C - 1; ++k) win[k] = win[k + 1];
         if (C > 1) win[C - 2] = pc;
+        if (t == snap_at)   // the state after this token, for a verify window that may keep only it
+            for (int k = 0; k < C - 1; ++k) snap[(size_t) k * D + c] = win[k];
     }
     for (int k = 0; k < C - 1; ++k) st[(size_t) k * D + c] = win[k];
 }
@@ -138,7 +140,7 @@ __global__ void k_gates_tokens(const float* g1, const float* dt, const float* A,
 // and written once a step, not twice a token); the arithmetic of each token is k_delta's, in its order
 template <int HD>
 __global__ void k_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
-                               float* o, int H, int T, int hd_rt) {
+                               float* o, int H, int T, int hd_rt, float* snap, int snap_at) {
     __shared__ float sq[HD], sk[HD], se[HD];
     const float scale = rsqrtf((float) hd_rt);   // at run time, as k_delta: a folded constant rounds differently
     const int h = (int) blockIdx.x, j = (int) threadIdx.x;
@@ -170,6 +172,11 @@ __global__ void k_delta_tokens(float* S, const float* q, const float* k, const f
             out += s * sq[i];
         }
         o[at + j] = out * scale;
+        if (t == snap_at) {   // the state after this token, for a verify window that may keep only it
+            float* Sn = snap + (size_t) h * HD * HD;
+#pragma unroll
+            for (int i = 0; i < HD; ++i) Sn[(size_t) i * HD + j] = col[i];
+        }
     }
 #pragma unroll
     for (int i = 0; i < HD; ++i) Sh[(size_t) i * HD + j] = col[i];
@@ -211,9 +218,11 @@ void glm_kda_delta_step(float* S, const float* q, const float* k, const float* v
     check("glm_kda_delta_step");
 }
 
-void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream) {
+void glm_kda_conv_tokens(const float* p, float* state, const float* w, float* out, int D, int C, int T, void* stream,
+                         float* snap, int snap_at) {
     if (C < 1 || C > 9) throw std::invalid_argument("glm_kda_conv_tokens: C");
-    k_conv_tokens<8><<<(unsigned) ((D + 255) / 256), 256, 0, (cudaStream_t) stream>>>(p, state, w, out, D, C, T);
+    if (snap == nullptr) snap_at = -1;
+    k_conv_tokens<8><<<(unsigned) ((D + 255) / 256), 256, 0, (cudaStream_t) stream>>>(p, state, w, out, D, C, T, snap, snap_at);
     check("glm_kda_conv_tokens");
 }
 
@@ -228,9 +237,10 @@ void glm_kda_gates_tokens(const float* g1, const float* dt_bias, const float* A,
 bool glm_kda_delta_tokens_supported(int hd) { return hd == 64 || hd == 128; }
 
 void glm_kda_delta_tokens(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
-                          float* o, int H, int hd, int T, void* stream) {
-    if (hd == 128) k_delta_tokens<128><<<(unsigned) H, 128, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd);
-    else if (hd == 64) k_delta_tokens<64><<<(unsigned) H, 64, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd);
+                          float* o, int H, int hd, int T, void* stream, float* snap, int snap_at) {
+    if (snap == nullptr) snap_at = -1;
+    if (hd == 128) k_delta_tokens<128><<<(unsigned) H, 128, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd, snap, snap_at);
+    else if (hd == 64) k_delta_tokens<64><<<(unsigned) H, 64, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, o, H, T, hd, snap, snap_at);
     else throw std::invalid_argument("glm_kda_delta_tokens: hd");
     check("glm_kda_delta_tokens");
 }

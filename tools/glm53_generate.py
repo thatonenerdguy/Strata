@@ -42,6 +42,7 @@ def main() -> int:
     ap.add_argument("--stream-threads", type=int, default=0, help="copier threads for the streamed experts (0: the tool's default, 8)")
     ap.add_argument("--pin-experts", type=int, default=-1, help="page-lock the expert tensors so streamed experts go up by "
                     "direct DMA (-1: the tool's default, off; 1: on, 45 -> 61 tok/s prompt on a 3060 but ~4 min more load)")
+    ap.add_argument("--mtp", type=int, default=0, help="MTP drafts a step from the GGUF's own nextn block (greedy only; 0: off, 1: one)")
     ap.add_argument("--pin-reserve-gb", type=float, default=-1, help="RAM to keep unpinned (-1: the tool's default, 16)")
     ap.add_argument("--gemm-min-rows", type=int, default=-1, help="prompt expert groups averaging this many rows or more run as "
                     "FP16 GEMMs (-1: the tool's default, 0: never)")
@@ -89,6 +90,8 @@ def main() -> int:
         cmd += ["--gemm-min-rows", str(a.gemm_min_rows)]
     if a.stream_threads > 0:
         cmd += ["--stream-threads", str(a.stream_threads)]
+    if a.mtp > 0:
+        cmd += ["--mtp", str(a.mtp)]
     if a.pin_experts >= 0:
         cmd += ["--pin-experts", str(a.pin_experts)]
     if a.pin_reserve_gb >= 0:
