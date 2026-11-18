@@ -52,6 +52,9 @@ struct NativeFmt {
     int had_block = 0;
     bool had_gu = false, had_d = false;
     int layer = -1;                     ///< the layer this format belongs to (set by expert_layout_load; STRATA_ACT_DUMP only)
+    /// GLM-5 family: the SwiGLU clamp, h = silu(min(gate, L)) * clamp(up, -L, L).  0 (every other family): no clamp,
+    /// and native_gu_rows takes exactly the paths it always took.  With it, gate and up rows run on ggml-cpu's dot.
+    float swiglu_limit = 0.f;
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
 };
@@ -61,7 +64,11 @@ constexpr size_t kNvfp4Tail = 16;
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// `pool_bounds`: also refuse a layer whose activations exceed the engine's fixed buffers (kNativeActBytes /
+/// kNativeHBytes).  A caller that sizes its own activations, and the pool's run_split_multi_native (wide layers get
+/// runtime-sized scratch), pass false.
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                bool pool_bounds = true);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

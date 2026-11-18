@@ -32,6 +32,10 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     err = strata::check_architecture(meta);
     if (!err.empty()) return false;
     const strata::ModelFamily family = strata::model_family(meta);
+    if (family == strata::ModelFamily::Glm5Next) {   // not this struct's shape: core/glm5_layout.hpp reads it
+        err = meta.path() + ": GLM-5.3-Flash has a geometry of its own (core::glm5_geometry_from_gguf)";
+        return false;
+    }
     const std::string p = std::string(strata::model_family_arch(family)) + ".";
     g = ModelGeometry{};
     g.family = family;

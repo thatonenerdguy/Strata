@@ -5,6 +5,7 @@ that says "this model writes XML calls" and the parser the server picks cannot d
 
     xml   `<tool_call>` around `<function=NAME>` and `<parameter=NAME>` blocks (Qwen3.6, Qwen3.8-Flash-Next: every template Strata ships)
     json  `<tool_call>` around a JSON object `{"name": ..., "arguments": {...}}` (Qwen3, Hermes)
+    glm   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` (GLM-4.5 to GLM-5.x)
     dsml  DeepSeek-V4's `<｜DSML｜...>` blocks
     none  the template has no tool section
     other the template documents tools in a form this module does not know
@@ -24,6 +25,8 @@ def tool_format(source: str) -> str:
     if _DSML in source:
         return "dsml"
     has_call = "<tool_call>" in source
+    if has_call and "<arg_key>" in source and "<arg_value>" in source:
+        return "glm"
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"
     if has_call and ("tools" in source) and ('"name"' in source or "'name'" in source or "| tojson" in source or "|tojson" in source):

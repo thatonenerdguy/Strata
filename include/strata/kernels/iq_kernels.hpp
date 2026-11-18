@@ -54,6 +54,10 @@ struct NativeExpertLayout {
     bool gu_nib = false;                // STRATA_EXPERT_NIBBLE: gate/up as 4-bit codes (strata/core/expert_nibble.hpp's
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
+    // GLM-5.3-Flash: the SwiGLU between gate/up and down is clamped (llama.cpp swiglu_clamp: gate at most limit, up
+    // within +-limit) when > 1e-6.  0 (every other model): the plain SwiGLU.  native_expert_grouped then runs gate/up,
+    // the clamped SwiGLU and the q8_1 quantization as separate launches (the fused gate/up forms have no clamp).
+    float swiglu_limit = 0.0f;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:

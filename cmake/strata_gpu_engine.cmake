@@ -73,6 +73,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gdn.cu
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
+                          src/kernels/cuda/glm_router.cu
+                          src/kernels/cuda/glm_mhc.cu
+                          src/kernels/cuda/glm_mla.cu
+                          src/kernels/cuda/glm_kda.cu
                           src/kernels/cuda/route_prior.cu
                           src/kernels/cuda/native_gdn_preprocess.cu
                           src/kernels/cuda/native_qsa.cu
@@ -543,6 +547,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata-q36 PRIVATE strata_qwen35 ${_strata_gpu_runtime_target})
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
+  endif()
+  # GLM-5.3-Flash (glm5-next) the same way: src/glm53/glm_generate.cu as a library `strata` switches to for a glm5-next
+  # model, and glm_generate wrapping it on its own.  CUDA only for now (its kernels are built and checked there).
+  if(STRATA_ENABLE_CUDA)
+    add_library(strata_glm53 STATIC src/glm53/glm_generate.cu)
+    target_include_directories(strata_glm53 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(strata_glm53 PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    target_link_libraries(strata PRIVATE strata_glm53)
+    target_compile_definitions(strata PRIVATE STRATA_HAVE_GLM53=1)
   endif()
 
   if(STRATA_ENABLE_HIP)

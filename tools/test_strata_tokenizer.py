@@ -448,3 +448,27 @@ class PreTokenizerType(unittest.TestCase):
         seq = [ST.regex.compile(x) for x in ST.DEEPSEEK3_PATTERNS]
         self.assertEqual(d._split(text), ST._sequence_findall(seq, text))
         self.assertEqual(ST.Tokenizer(toks, [], None, "deepseek-v3")._split(text), d._split(text))
+        g = ST.Tokenizer(toks, [], None, "glm5")
+        self.assertEqual(g._split(text), ST.regex.compile(ST.GLM4_PATTERN).findall(text))
+        self.assertEqual(ST.Tokenizer(toks, [], None, "glm4")._split(text), g._split(text))
+
+    def test_glm_names_and_split(self):
+        self.assertEqual(ST.pre_tokenizer_kind("glm4"), "glm4")
+        self.assertEqual(ST.pre_tokenizer_kind("glm5"), "glm4")
+        self.assertIsNone(ST.pre_tokenizer_kind("chatglm-bpe"))        # ChatGLM's own rule is another one
+        g = ST.Tokenizer([chr(i) for i in range(32, 127)], [], None, "glm5")
+        # digits in runs of at most 3 (qwen35 splits them one by one); a contraction is its own piece
+        self.assertEqual(g._split("12345 it's"), ["123", "45", " it", "'s"])
+
+    def test_glm_ignore_merges(self):
+        # "abc" is a vocabulary entry, but the merges alone would give a + bc: glm4 emits the whole entry, qwen35 does not
+        toks = ["a", "b", "c", "bc", "abc", "\u0120", "\u0120a"]
+        merges = ["b c", "\u0120 a"]
+        glm = ST.Tokenizer(toks, merges, None, "glm5")
+        qwen = ST.Tokenizer(toks, merges, None, "qwen35")
+        self.assertEqual(glm.encode("abc"), [4])
+        self.assertEqual(qwen.encode("abc"), [0, 3])
+        self.assertEqual(glm.decode(glm.encode("abc a")), "abc a")
+        self.assertEqual(glm.encode("abc a"), [4, 6])
+        # a piece that is not a whole entry still goes through BPE
+        self.assertEqual(glm.encode("bcb"), [3, 1])

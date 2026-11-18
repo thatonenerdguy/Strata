@@ -62,8 +62,10 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+        out = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        if add_generation_prompt and kwargs.get("enable_thinking") is False and out.endswith("<think>"):
+            out += "</think>"       # a template with no thinking switch (GLM-5) that opens the reasoning: closed, as its history writes it
+        return out
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
@@ -1169,6 +1171,9 @@ class OutputParser:
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
+        # GLM-5 opens its reasoning itself (its template ends at <|assistant|>; Qwen's opens <think> in the prompt): a reply
+        # that starts with <think> has it dropped once, so it never shows as reasoning text.  Decided by the first text.
+        self._lead_think = thinking
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # #4663: the request defers tools (Anthropic's tool search, see anthropic_tools): the client holds back more tools
@@ -1687,6 +1692,16 @@ class OutputParser:
         if self._held:
             delta, self._held = self._held + delta, ""
         self.buf += delta
+        if self._lead_think and self.state == "reasoning":
+            head = self.buf.lstrip()
+            if head.startswith("<think>"):
+                self.buf, self._lead_think = head[len("<think>"):], False
+            elif "<think>".startswith(head):
+                return []                        # only whitespace or the start of <think> so far: wait for more
+            else:
+                self._lead_think = False
+        elif self._lead_think:
+            self._lead_think = False
         if self.schemas and delta:
             self._held = self._prefixed(len(delta))
         return self._feed()
@@ -2079,9 +2094,156 @@ class JsonOutputParser(OutputParser):
                          declared_only=declared_only, deferred=deferred)
 
 
+GLM_KEY, GLM_KEY_END, GLM_VAL, GLM_VAL_END = "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"
+_GLM_NAME = re.compile(r"[^\s<>]+")
+GLM_NAME_MAX = 256         # the most text after `<tool_call>` that waits for the call's first `<arg_key>` or its `</tool_call>`
+
+
+def _held_prefix(text: str, tags: tuple[str, ...]) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
+    for k in range(min(len(text), max(len(t) for t in tags) - 1), 0, -1):
+        if any(t.startswith(text[-k:]) for t in tags):
+            return k
+    return 0
+
+
+class GlmCallTranslator:
+    """GLM's call spelling, `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` (GLM-4.5 to GLM-5.x), turned
+    into the one OutputParser reads, `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`, as the
+    text streams in.  A tag split across deltas is held back until it is complete.  Everything else (where a call may open, declared
+    tools, values by the tool's types, streamed arguments) is left to OutputParser.  `<tool_call>` followed by anything that is not a
+    name and then `<arg_key>` or `</tool_call>` (prose, or the Qwen form), or that names a tool `callable_name` refuses, passes
+    through as written."""
+
+    def __init__(self, callable_name=None):
+        self.state, self.p = "text", ""
+        self.callable_name = callable_name       # a name that may not be called is left as the model wrote it
+
+    @property
+    def holding(self) -> bool:
+        return bool(self.p) or self.state != "text"
+
+    def _raw(self) -> str:
+        """The text after `<tool_call>` is not a GLM call: it goes on as written."""
+        self.state = "text"
+        return CALL_START
+
+    def feed(self, delta: str) -> str:
+        self.p += delta
+        out = []
+        while True:
+            p = self.p
+            if self.state == "text":
+                i = p.find(CALL_START)
+                if i < 0:
+                    keep = _held_prefix(p, (CALL_START,))
+                    out.append(p[:len(p) - keep])
+                    self.p = p[len(p) - keep:]
+                    return "".join(out)
+                out.append(p[:i])
+                self.p, self.state = p[i + len(CALL_START):], "name"
+            elif self.state == "name":
+                k, e = p.find(GLM_KEY), p.find(CALL_END)
+                j = min(x for x in (k, e) if x >= 0) if k >= 0 or e >= 0 else -1
+                s = p.lstrip()
+                if j < 0:
+                    if len(p) > GLM_NAME_MAX or (s.startswith("<") and not GLM_KEY.startswith(s[:len(GLM_KEY)])
+                                                  and not CALL_END.startswith(s[:len(CALL_END)])):
+                        out.append(self._raw())      # prose, or the call in another form: OutputParser reads it as written
+                        continue
+                    return "".join(out)
+                name = p[:j].strip()
+                if not _GLM_NAME.fullmatch(name) or (self.callable_name is not None and not self.callable_name(name)):
+                    out.append(self._raw())
+                    continue
+                out.append(f"{CALL_START}\n{FUNC_START}{name}>\n")
+                if j == k:
+                    self.p, self.state = p[j + len(GLM_KEY):], "key"
+                else:
+                    out.append(f"{FUNC_END}\n{CALL_END}")
+                    self.p, self.state = p[j + len(CALL_END):], "text"
+            elif self.state == "key":
+                k = p.find(GLM_KEY_END)
+                if k < 0:
+                    return "".join(out)
+                out.append(f"{PARAM_START}{p[:k].strip()}>\n")
+                self.p, self.state = p[k + len(GLM_KEY_END):], "open_value"
+            elif self.state == "open_value":
+                s = p.lstrip()
+                if s.startswith(GLM_VAL):
+                    self.p, self.state = s[len(GLM_VAL):], "value"
+                elif GLM_VAL.startswith(s):
+                    return "".join(out)
+                else:                                # a key with no value: an empty one
+                    out.append(f"\n{PARAM_END}\n")
+                    self.p, self.state = s, "between"
+            elif self.state == "value":
+                v = p.find(GLM_VAL_END)
+                if v < 0:
+                    keep = _held_prefix(p, (GLM_VAL_END,))
+                    out.append(p[:len(p) - keep])
+                    self.p = p[len(p) - keep:]
+                    return "".join(out)
+                out.append(p[:v] + f"\n{PARAM_END}\n")
+                self.p, self.state = p[v + len(GLM_VAL_END):], "between"
+            else:                                    # between: the next `<arg_key>`, or the call's `</tool_call>`
+                s = p.lstrip()
+                if s.startswith(GLM_KEY):
+                    self.p, self.state = s[len(GLM_KEY):], "key"
+                elif s.startswith(CALL_END):
+                    out.append(f"{FUNC_END}\n{CALL_END}")
+                    self.p, self.state = s[len(CALL_END):], "text"
+                elif not s or GLM_KEY.startswith(s) or CALL_END.startswith(s):
+                    return "".join(out)
+                else:                                # the closer left out: the call ends at its last value
+                    out.append(f"{FUNC_END}\n{CALL_END}")
+                    self.p, self.state = s, "text"
+
+    def finish(self) -> str:
+        """The end of the output: a call whose last value is complete is closed; anything else held goes out as it is."""
+        if self.state == "between" and not self.p.strip():
+            out = f"{FUNC_END}\n{CALL_END}"
+        elif self.state == "name":
+            out = CALL_START + self.p
+        else:
+            out = self.p
+        self.state, self.p = "text", ""
+        return out
+
+
+class GlmOutputParser(OutputParser):
+    """The parser for a GLM chat template (`<arg_key>` / `<arg_value>` calls): GlmCallTranslator in front of OutputParser."""
+
+    def __init__(self, *args, **kwargs):
+        self.glm = GlmCallTranslator()
+        super().__init__(*args, **kwargs)
+        self.glm.callable_name = lambda name: self._callable(self.aliases.get(name, name))
+
+    @staticmethod
+    def force_text(force: str | None) -> str | None:
+        """forced_call's opening (`<tool_call>\n` or `<tool_call>\n<function=NAME>\n`) in GLM's spelling."""
+        if force is None:
+            return None
+        m = re.fullmatch(r"<tool_call>\s*(?:<function=([^<>]*)>\s*)?", force)
+        return CALL_START + (m.group(1).strip() if m and m.group(1) else "") if m else force
+
+    @property
+    def clean(self) -> bool:
+        return super().clean and not self.glm.holding
+
+    def feed(self, delta: str) -> list[Event]:
+        return super().feed(self.glm.feed(delta)) if delta else super().feed("")
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        tail = self.glm.finish()
+        out = super().feed(tail) if tail else []
+        return out + super().finish(reason)
+
+
 def parser_for_template(source: str | None):
     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
-    the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
-    here reads keep OutputParser (the same class as before this existed)."""
+    the JSON form gets JsonOutputParser, GLM's `<arg_key>` form GlmOutputParser; the XML form every Strata model ships with,
+    templates without tools, and forms nothing here reads keep OutputParser (the same class as before this existed)."""
     from serve import toolformat
-    return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
+    form = toolformat.tool_format(source or "")
+    return {"json": JsonOutputParser, "glm": GlmOutputParser}.get(form, OutputParser)
